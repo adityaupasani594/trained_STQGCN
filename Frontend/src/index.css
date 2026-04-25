@@ -1,0 +1,62 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Oxanium:wght@400;600;700&display=swap');
+@import 'tailwindcss';
+
+:root {
+  font-family: 'Space Grotesk', sans-serif;
+  color: #e7f1ff;
+  background: #070f1d;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  min-height: 100vh;
+}
+
+.font-display {
+  font-family: 'Oxanium', sans-serif;
+}
+
+.bg-night-grid {
+  background:
+    radial-gradient(circle at 9% 14%, rgba(20, 197, 255, 0.15) 0%, rgba(20, 197, 255, 0) 40%),
+    radial-gradient(circle at 90% 82%, rgba(255, 97, 71, 0.16) 0%, rgba(255, 97, 71, 0) 42%),
+    linear-gradient(160deg, #07111d 0%, #111f31 50%, #09121f 100%);
+}
+
+.glass-panel {
+  background: linear-gradient(145deg, rgba(14, 27, 43, 0.86), rgba(9, 18, 31, 0.76));
+  backdrop-filter: blur(10px);
+}
+
+input[type='range']::-webkit-slider-thumb {
+  appearance: none;
+  height: 16px;
+  width: 16px;
+  border-radius: 999px;
+  background: #5eead4;
+  border: 2px solid #072530;
+  box-shadow: 0 0 0 2px rgba(94, 234, 212, 0.3);
+}
+
+input[type='range']::-moz-range-thumb {
+  height: 16px;
+  width: 16px;
+  border-radius: 999px;
+  background: #5eead4;
+  border: 2px solid #072530;
+  box-shadow: 0 0 0 2px rgba(94, 234, 212, 0.3);
+}
