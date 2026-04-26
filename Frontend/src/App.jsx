@@ -12,6 +12,8 @@ const DEFAULTS = {
   timeOfDay: 14,
 }
 
+const LIVE_REFRESH_MS = 5_000
+
 const ROAD_PATHS = [
   // Primary North-South Arterial (Curved)
   [[-15.2, 0.2, 8.5], [-14.8, 0.2, 4.2], [-14.5, 0.2, 0.1], [-15.0, 0.2, -4.5], [-15.5, 0.2, -8.2]],
@@ -504,7 +506,7 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
       Object.entries(overridesPayload).forEach(([idx, vals]) => {
         const entry = {}
         if (vals.trafficFlow !== undefined) entry.traffic_flow = vals.trafficFlow
-        if (vals.avgSpeed    !== undefined) entry.avg_speed    = vals.avgSpeed
+        if (vals.avgSpeed !== undefined) entry.avg_speed = vals.avgSpeed
         if (Object.keys(entry).length > 0) apiOverrides[String(idx)] = entry
       })
 
@@ -519,7 +521,7 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
       const resp = await fetch(apiUrl('/api/nodes/forecast'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           overrides: apiOverrides,
           global_params: apiGlobal
         }),
@@ -541,7 +543,7 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
   // Initial load
   useEffect(() => {
     fetchWithOverrides({}, params)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Debounced re-inference whenever overrides OR global params change
@@ -551,16 +553,16 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
       fetchWithOverrides(nodeOverrides, params)
     }, 350)
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeOverrides, params])
 
   // Background auto-refresh
   useEffect(() => {
     autoRefreshRef.current = setInterval(() => {
       fetchWithOverrides(nodeOverrides, params, true)
-    }, 30_000)
+    }, LIVE_REFRESH_MS)
     return () => clearInterval(autoRefreshRef.current)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeOverrides, params])
 
   // Scroll selected node into view whenever it changes
@@ -598,7 +600,7 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
             animation: 'pulse 2s infinite',
           }} />
           <p style={{ fontSize: '0.72rem', fontWeight: 700, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#67e8f9', margin: 0 }}>
-            15-min Ahead Forecast — ST-QGCN Model{hasOverrides ? ' (with overrides)' : ''}
+            5-Seconds Ahead Forecast — Spatio-Temporal-QGCN Model{hasOverrides ? ' (with overrides)' : ''}
           </p>
         </div>
         <p style={{ fontSize: '0.65rem', color: inferring ? '#fbbf24' : '#64748b', margin: 0 }}>
@@ -615,7 +617,7 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
         }}>
           <thead style={{ position: 'sticky', top: 0, zIndex: 2 }}>
             <tr style={{ background: '#0b1829' }}>
-              {['Node', 'Zone', 'Pred. Flow (veh/hr)', 'Capacity', 'Util %', 'Congestion', 'Trend'].map((h) => (
+              {['Node', 'Zone', 'Predicted Flow (vehicle/hour)', 'Capacity', 'Util %', 'Congestion', 'Trend'].map((h) => (
                 <th key={h} style={{
                   padding: '6px 10px',
                   textAlign: 'left',
@@ -719,6 +721,92 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
   )
 }
 
+function ReportsView({ activeRun, setActiveRun, runs, isLoadingApi, apiError, history, onBack }) {
+  const [plots, setPlots] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const fetchPlots = async () => {
+      try {
+        setLoading(true)
+        const resp = await fetch(apiUrl(`/api/runs/${activeRun}/plots`))
+        if (!resp.ok) throw new Error('Failed to fetch plots')
+        const data = await resp.json()
+        setPlots(data.plots || [])
+      } catch (err) {
+        setError(err.message)
+      } finally {
+        setLoading(false)
+      }
+    }
+    if (activeRun) fetchPlots()
+  }, [activeRun])
+
+  return (
+    <div className="mx-auto flex h-full w-full max-w-[1400px] flex-col px-5 pb-6 pt-6 md:px-8">
+      <div className="mb-6 flex items-center justify-between">
+        <div>
+          <p className="font-mono text-xs uppercase tracking-[0.2em] text-cyan-300/90">Run Reports</p>
+          <h2 className="mt-1 font-display text-3xl font-semibold text-white">Simulation Graphs</h2>
+        </div>
+      </div>
+
+      <div className="flex flex-1 flex-col gap-6 overflow-hidden md:flex-row">
+        <div className="glass-panel w-full flex-shrink-0 overflow-y-auto rounded-3xl border border-slate-200/15 p-6 md:w-[360px]">
+          <h3 className="mb-4 font-display text-xl text-white">Run Details</h3>
+          <div className="rounded-xl border border-cyan-300/20 bg-slate-900/50 p-4">
+            <p className="text-xs font-semibold uppercase tracking-wider text-cyan-200">Connected Run</p>
+            <select
+              className="mt-2 w-full rounded-lg border border-slate-500/40 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+              value={activeRun}
+              onChange={(e) => setActiveRun(e.target.value)}
+              disabled={runs.length === 0}
+            >
+              {runs.map((runName) => (
+                <option key={runName} value={runName}>
+                  {runName}
+                </option>
+              ))}
+            </select>
+            {isLoadingApi ? <p className="mt-2 text-xs text-slate-400">Loading backend runs...</p> : null}
+            {apiError ? <p className="mt-2 text-xs text-rose-300">{apiError}</p> : null}
+            <TrainingSparkline history={history} />
+          </div>
+
+          <button
+            onClick={onBack}
+            className="mt-6 w-full rounded-xl border border-cyan-300/30 bg-cyan-500/10 px-4 py-3 font-semibold text-cyan-100 transition hover:bg-cyan-500/20"
+          >
+            &larr; Back to Simulation
+          </button>
+        </div>
+
+        <div className="glass-panel flex-1 overflow-y-auto rounded-3xl border border-slate-200/15 p-6">
+          {loading ? (
+            <p className="text-slate-400">Loading graphs...</p>
+          ) : error ? (
+            <p className="text-rose-400">{error}</p>
+          ) : plots.length === 0 ? (
+            <p className="text-slate-400">No graphs found for this run.</p>
+          ) : (
+            <div className="grid grid-cols-1 gap-8 lg:grid-cols-2">
+              {plots.map((plot) => (
+                <div key={plot.name} className="flex flex-col rounded-2xl border border-slate-700/50 bg-slate-900/40 p-4">
+                  <h3 className="mb-3 text-sm font-semibold capitalize text-cyan-100">{plot.name.replace(/_/g, ' ').replace(/\.[^/.]+$/, '')}</h3>
+                  <div className="flex flex-1 items-center justify-center rounded-xl bg-slate-950 p-2">
+                    <img src={apiUrl(plot.url)} alt={plot.name} className="max-h-[400px] w-full object-contain" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [params, setParams] = useState(DEFAULTS)
   const [runs, setRuns] = useState([])
@@ -731,6 +819,7 @@ function App() {
   const [selectedNode, setSelectedNode] = useState(0)
   const [nodeOverrides, setNodeOverrides] = useState({})
   const [showMetrics, setShowMetrics] = useState(true)
+  const [currentView, setCurrentView] = useState('simulation')
 
   const network = useMemo(() => buildComplexNetwork(), [])
   const nodes = network.junctionNodes
@@ -755,9 +844,9 @@ function App() {
     return Array.from({ length: n }, (_, idx) => {
       const row = byIndex[idx]
       if (!row) return { flow: 0, speed: 0, congestion: 0 }
-      const flow     = row.predicted_flow_veh_per_hr
+      const flow = row.predicted_flow_veh_per_hr
       const capacity = row.capacity_veh_per_hr
-      const ratio    = capacity > 0 ? clamp(flow / capacity, 0, 1) : 0
+      const ratio = capacity > 0 ? clamp(flow / capacity, 0, 1) : 0
       // Derive a [0,1] congestion score directly from utilisation ratio
       const congestion = ratio
       return { flow, speed: 0, congestion }
@@ -840,7 +929,7 @@ function App() {
     }
 
     loadRunPayload()
-    const timer = setInterval(loadRunPayload, 15000)
+    const timer = setInterval(loadRunPayload, LIVE_REFRESH_MS)
     return () => clearInterval(timer)
   }, [activeRun])
 
@@ -866,179 +955,156 @@ function App() {
 
   return (
     <div className="h-screen overflow-hidden bg-night-grid text-slate-100">
-      <motion.header
-        initial={{ y: -28, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.55, ease: 'easeOut' }}
-        className="mx-auto flex w-full max-w-[1400px] items-center justify-between px-5 pb-4 pt-6 md:px-8"
-      >
-        <div>
-          <p className="font-mono text-xs uppercase tracking-[0.2em] text-cyan-300/90">ST-QGCN Urban Digital Twin</p>
-          <h1 className="mt-2 font-display text-3xl font-semibold leading-tight text-white md:text-4xl">
-            Chembur Network Command Deck
-          </h1>
-        </div>
-        <div className="hidden items-center gap-3 rounded-full border border-cyan-300/30 bg-cyan-900/30 px-4 py-2 text-xs font-semibold text-cyan-100 md:flex">
-          <span className="h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_16px_#34d399]" />
-          LIVE NETWORK FEED
-        </div>
-      </motion.header>
-
-      <main className="mx-auto grid h-[calc(100vh-118px)] w-full max-w-[1400px] gap-5 px-5 pb-6 md:grid-cols-[360px_1fr] md:px-8">
-        <motion.aside
-          initial={{ x: -24, opacity: 0 }}
-          animate={{ x: 0, opacity: 1 }}
-          transition={{ duration: 0.6, delay: 0.1 }}
-          className="glass-panel h-full overflow-y-auto rounded-3xl p-5 shadow-2xl shadow-black/30"
-        >
-          <h2 className="font-display text-xl text-white">Simulation Controls</h2>
-          <p className="mt-1 text-sm text-slate-300">
-            Click any node in the network to tune local traffic behavior.
-          </p>
-
-          <div className="mt-4 rounded-xl border border-cyan-300/20 bg-slate-900/50 p-3">
-            <p className="text-xs font-semibold uppercase tracking-wider text-cyan-200">Connected Run</p>
-            <select
-              className="mt-2 w-full rounded-lg border border-slate-500/40 bg-slate-900 px-3 py-2 text-sm text-slate-100"
-              value={activeRun}
-              onChange={(e) => setActiveRun(e.target.value)}
-              disabled={runs.length === 0}
-            >
-              {runs.map((runName) => (
-                <option key={runName} value={runName}>
-                  {runName}
-                </option>
-              ))}
-            </select>
-            {isLoadingApi ? <p className="mt-2 text-xs text-slate-400">Loading backend runs...</p> : null}
-            {apiError ? <p className="mt-2 text-xs text-rose-300">{apiError}</p> : null}
-            <TrainingSparkline history={history} />
-          </div>
-
-          <div className="mt-6 space-y-5">
-            <Slider label="Rain" value={params.rain} min={0} max={100} step={1} unit="%" onChange={setParam('rain')} />
-            <Slider label="Wind" value={params.wind} min={0} max={60} step={1} unit=" km/h" onChange={setParam('wind')} />
-            <Slider label="Time of Day" value={params.timeOfDay} min={0} max={23} step={1} unit=":00" onChange={setParam('timeOfDay')} />
-            <Slider label="Temperature" value={params.temperature} min={-5} max={45} step={1} unit=" C" onChange={setParam('temperature')} />
-          </div>
-
-          <div className="mt-6 rounded-xl border border-amber-300/25 bg-slate-900/60 p-3">
-            <p className="text-xs font-semibold uppercase tracking-wide text-amber-200">Selected Node</p>
-            <p className="mt-1 text-sm font-semibold text-white">{selectedNodeName}</p>
-            <p className="mt-1 text-xs text-slate-300">Tap a node in the scene to edit local parameters.</p>
-            <div className="mt-4 space-y-4">
-              <Slider
-                label="Traffic Density"
-                value={selectedState.trafficFlow}
-                min={50}
-                max={1200}
-                step={1}
-                unit=" veh/km"
-                onChange={(v) => setSelectedNodeParam('trafficFlow', v)}
-              />
-              <Slider
-                label="Avg Speed"
-                value={selectedState.avgSpeed}
-                min={5}
-                max={100}
-                step={1}
-                unit=" kmph"
-                onChange={(v) => setSelectedNodeParam('avgSpeed', v)}
-              />
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => {
-              setParams(DEFAULTS)
-              setNodeOverrides({})
-            }}
-            className="mt-6 w-full rounded-xl border border-cyan-300/30 bg-cyan-500/10 px-4 py-3 font-semibold text-cyan-100 transition hover:bg-cyan-500/20"
+      {currentView === 'reports' ? (
+        <ReportsView
+          activeRun={activeRun}
+          setActiveRun={setActiveRun}
+          runs={runs}
+          isLoadingApi={isLoadingApi}
+          apiError={apiError}
+          history={history}
+          onBack={() => setCurrentView('simulation')}
+        />
+      ) : (
+        <>
+          <motion.header
+            initial={{ y: -28, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ duration: 0.55, ease: 'easeOut' }}
+            className="mx-auto flex w-full max-w-[1400px] items-center justify-between px-5 pb-4 pt-6 md:px-8"
           >
-            Reset Scenario
-          </button>
-        </motion.aside>
-
-        <motion.section
-          initial={{ y: 24, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          transition={{ duration: 0.7, delay: 0.15 }}
-          className="glass-panel relative h-full overflow-hidden rounded-3xl border border-slate-200/15"
-          style={{ display: 'flex', flexDirection: 'column' }}
-        >
-          {/* 3-D canvas — takes ~58% of height */}
-          <div style={{ position: 'relative', flex: '0 0 58%', overflow: 'hidden' }}>
-            <div className={`absolute left-4 top-4 z-10 rounded-xl border border-amber-300/20 bg-slate-900/70 text-xs text-slate-200 backdrop-blur transition-all duration-300 ${showMetrics ? 'px-4 py-3 w-64' : 'px-3 py-2 w-auto'}`}>
-              <div className="flex items-center justify-between gap-4">
-                <p className="font-semibold tracking-wide text-amber-200">Live Metrics</p>
-                <button 
-                  onClick={() => setShowMetrics(!showMetrics)}
-                  className="rounded-md bg-white/10 px-1.5 py-0.5 text-[10px] hover:bg-white/20"
-                >
-                  {showMetrics ? 'Hide' : 'Show'}
-                </button>
-              </div>
-              
-              {showMetrics && (
-                <motion.div 
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  className="overflow-hidden"
-                >
-                  <p className="mt-2">Heat Pressure: {liveHeatPressure}%</p>
-                  <p>Weather Severity: {liveWeatherSeverity}%</p>
-                  <p>Daylight: {Math.round(dayFactor * 100)}%</p>
-                  <div className="mt-3 space-y-1 border-t border-white/5 pt-2">
-                    <p className="text-cyan-200">Backend Best Val MSE: {Number.isFinite(bestVal) ? bestVal.toFixed(4) : 'n/a'}</p>
-                    <p>Backend Test MSE: {Number.isFinite(testMse) ? testMse.toFixed(4) : 'n/a'}</p>
-                    <p>Backend Test MAE: {Number.isFinite(testMae) ? testMae.toFixed(4) : 'n/a'}</p>
-                    <p>Best Epoch: {Number.isFinite(bestEpoch) ? bestEpoch : 'n/a'}</p>
-                  </div>
-                </motion.div>
-              )}
+            <div>
+              <p className="font-mono text-xs uppercase tracking-[0.2em] text-cyan-300/90">ST-QGCN Urban Digital Twin</p>
+              <h1 className="mt-2 font-display text-3xl font-semibold leading-tight text-white md:text-4xl">
+                Chembur Network Command Deck
+              </h1>
             </div>
+            {/* <div className="hidden items-center gap-3 rounded-full border border-cyan-300/30 bg-cyan-900/30 px-4 py-2 text-xs font-semibold text-cyan-100 md:flex">
+              <span className="h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_16px_#34d399]" />
+              LIVE NETWORK FEED
+            </div> */}
+          </motion.header>
 
-            <div className="h-full min-h-[320px] w-full">
-              <Canvas shadows gl={{ antialias: true }} dpr={[1, 1.8]}>
-                <PerspectiveCamera makeDefault position={[14, 14, 20]} fov={52} />
-                <NetworkScene
-                  params={params}
+          <main className="mx-auto grid h-[calc(100vh-118px)] w-full max-w-[1400px] gap-5 px-5 pb-6 md:grid-cols-[360px_1fr] md:px-8">
+            <motion.aside
+              initial={{ x: -24, opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              transition={{ duration: 0.6, delay: 0.1 }}
+              className="glass-panel h-full overflow-y-auto rounded-3xl p-5 shadow-2xl shadow-black/30"
+            >
+              <h2 className="font-display text-xl text-white">Simulation Controls</h2>
+              <p className="mt-1 text-sm text-slate-300">
+                Click any node in the network to tune local traffic behavior.
+              </p>
+
+              {/* Connected Run selector moved to ReportsView */}
+
+              <div className="mt-6 space-y-5">
+                <Slider label="Rain" value={params.rain} min={0} max={100} step={1} unit="%" onChange={setParam('rain')} />
+                <Slider label="Wind" value={params.wind} min={0} max={60} step={1} unit=" km/h" onChange={setParam('wind')} />
+                <Slider label="Time of Day" value={params.timeOfDay} min={0} max={23} step={1} unit=":00" onChange={setParam('timeOfDay')} />
+                <Slider label="Temperature" value={params.temperature} min={-5} max={45} step={1} unit=" C" onChange={setParam('temperature')} />
+              </div>
+
+              <div className="mt-6 rounded-xl border border-amber-300/25 bg-slate-900/60 p-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-amber-200">Selected Node</p>
+                <p className="mt-1 text-sm font-semibold text-white">{selectedNodeName}</p>
+                <p className="mt-1 text-xs text-slate-300">Tap a node in the scene to edit local parameters.</p>
+                <div className="mt-4 space-y-4">
+                  <Slider
+                    label="Traffic Density"
+                    value={selectedState.trafficFlow}
+                    min={50}
+                    max={1200}
+                    step={1}
+                    unit=" veh/km"
+                    onChange={(v) => setSelectedNodeParam('trafficFlow', v)}
+                  />
+                  <Slider
+                    label="Avg Speed"
+                    value={selectedState.avgSpeed}
+                    min={5}
+                    max={100}
+                    step={1}
+                    unit=" kmph"
+                    onChange={(v) => setSelectedNodeParam('avgSpeed', v)}
+                  />
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setParams(DEFAULTS)
+                  setNodeOverrides({})
+                }}
+                className="mt-6 w-full rounded-xl border border-cyan-300/30 bg-cyan-500/10 px-4 py-3 font-semibold text-cyan-100 transition hover:bg-cyan-500/20"
+              >
+                Reset Scenario
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setCurrentView('reports')}
+                className="mt-3 w-full rounded-xl border border-emerald-300/30 bg-emerald-500/10 px-4 py-3 font-semibold text-emerald-100 transition hover:bg-emerald-500/20"
+              >
+                View Generated Graphs
+              </button>
+            </motion.aside>
+
+            <motion.section
+              initial={{ y: 24, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              transition={{ duration: 0.7, delay: 0.15 }}
+              className="glass-panel relative h-full overflow-hidden rounded-3xl border border-slate-200/15"
+              style={{ display: 'flex', flexDirection: 'column' }}
+            >
+              {/* 3-D canvas — takes ~58% of height */}
+              <div style={{ position: 'relative', flex: '0 0 58%', overflow: 'hidden' }}>
+
+
+                <div className="h-full min-h-[320px] w-full">
+                  <Canvas shadows gl={{ antialias: true }} dpr={[1, 1.8]}>
+                    <PerspectiveCamera makeDefault position={[14, 14, 20]} fov={52} />
+                    <NetworkScene
+                      params={params}
+                      selectedNode={selectedNode}
+                      onNodeSelect={setSelectedNode}
+                      network={network}
+                      nodeState={nodeState}
+                      networkLoad={networkLoad}
+                    />
+                  </Canvas>
+                </div>
+              </div>
+
+              {/* Divider */}
+              <div style={{
+                height: 1,
+                background: 'linear-gradient(90deg, transparent, rgba(103,232,249,0.25), transparent)',
+                flexShrink: 0,
+              }} />
+
+              {/* Node Forecast Table — takes remaining ~42% */}
+              <div style={{
+                flex: '1 1 0',
+                overflow: 'hidden',
+                background: 'rgba(4, 16, 34, 0.75)',
+                backdropFilter: 'blur(12px)',
+              }}>
+                <NodeForecastTable
                   selectedNode={selectedNode}
                   onNodeSelect={setSelectedNode}
-                  network={network}
-                  nodeState={nodeState}
-                  networkLoad={networkLoad}
+                  nodeOverrides={nodeOverrides}
+                  onForecastData={setForecastData}
+                  params={params}
+                  nodes={nodes}
                 />
-              </Canvas>
-            </div>
-          </div>
-
-          {/* Divider */}
-          <div style={{
-            height: 1,
-            background: 'linear-gradient(90deg, transparent, rgba(103,232,249,0.25), transparent)',
-            flexShrink: 0,
-          }} />
-
-          {/* Node Forecast Table — takes remaining ~42% */}
-          <div style={{
-            flex: '1 1 0',
-            overflow: 'hidden',
-            background: 'rgba(4, 16, 34, 0.75)',
-            backdropFilter: 'blur(12px)',
-          }}>
-            <NodeForecastTable
-              selectedNode={selectedNode}
-              onNodeSelect={setSelectedNode}
-              nodeOverrides={nodeOverrides}
-              onForecastData={setForecastData}
-              params={params}
-              nodes={nodes}
-            />
-          </div>
-        </motion.section>
-      </main>
+              </div>
+            </motion.section>
+          </main>
+        </>
+      )}
     </div>
   )
 }
