@@ -488,18 +488,27 @@ function TrendArrow({ trend }) {
   )
 }
 
-function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForecastData, params, nodes }) {
+function MiniUtilBar({ flow, capacity }) {
+  const util = Math.min(100, Math.round((flow / (capacity || 1)) * 100))
+  const color = util > 74 ? '#ef4444' : util > 54 ? '#f97316' : util > 29 ? '#facc15' : '#22c55e'
+  return (
+    <div style={{ marginTop: 4, width: '100%', height: 3, background: 'rgba(255,255,255,0.08)', borderRadius: 4, overflow: 'hidden' }}>
+      <div style={{ width: `${util}%`, height: '100%', background: color, transition: 'width 0.8s cubic-bezier(0.4, 0, 0.2, 1)' }} />
+    </div>
+  )
+}
+
+function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForecastData, params, nodes, isSimulating, simStep }) {
   const [forecast, setForecast] = useState(null)
   const [loading, setLoading] = useState(true)
   const [inferring, setInferring] = useState(false)
   const [lastTs, setLastTs] = useState('')
   const rowRefs = useRef({})
   const debounceRef = useRef(null)
-  const autoRefreshRef = useRef(null)
 
   // POST overrides to the model and receive real predictions
-  const fetchWithOverrides = async (overridesPayload, globalParams, isBackground = false) => {
-    if (!isBackground) setInferring(true)
+  const fetchWithOverrides = async (overridesPayload, globalParams, stepOffset = 0) => {
+    setInferring(true)
     try {
       // Translate nodeOverrides
       const apiOverrides = {}
@@ -523,7 +532,9 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           overrides: apiOverrides,
-          global_params: apiGlobal
+          global_params: apiGlobal,
+          step_offset: stepOffset,
+          n_steps: 3
         }),
       })
       if (!resp.ok) return
@@ -536,34 +547,26 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
       // network error
     } finally {
       setLoading(false)
-      if (!isBackground) setInferring(false)
+      setInferring(false)
     }
   }
 
-  // Initial load
+  // Initial load — one request on mount
   useEffect(() => {
-    fetchWithOverrides({}, params)
+    fetchWithOverrides({}, params, 0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Debounced re-inference whenever overrides OR global params change
+  // Re-inference: fires when sliders change (params/overrides) OR when simulation
+  // advances a step. Debounced so rapid slider drags only fire once.
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current)
     debounceRef.current = setTimeout(() => {
-      fetchWithOverrides(nodeOverrides, params)
+      fetchWithOverrides(nodeOverrides, params, simStep)
     }, 350)
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeOverrides, params])
-
-  // Background auto-refresh
-  useEffect(() => {
-    autoRefreshRef.current = setInterval(() => {
-      fetchWithOverrides(nodeOverrides, params, true)
-    }, LIVE_REFRESH_MS)
-    return () => clearInterval(autoRefreshRef.current)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeOverrides, params])
+  }, [nodeOverrides, params, simStep])
 
   // Scroll selected node into view whenever it changes
   useEffect(() => {
@@ -600,7 +603,7 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
             animation: 'pulse 2s infinite',
           }} />
           <p style={{ fontSize: '0.72rem', fontWeight: 700, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#67e8f9', margin: 0 }}>
-            5-Seconds Ahead Forecast — Spatio-Temporal-QGCN Model{hasOverrides ? ' (with overrides)' : ''}
+            5-Second Ahead Forecast - Spatiotemporal QGCN Model
           </p>
         </div>
         <p style={{ fontSize: '0.65rem', color: inferring ? '#fbbf24' : '#64748b', margin: 0 }}>
@@ -617,9 +620,9 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
         }}>
           <thead style={{ position: 'sticky', top: 0, zIndex: 2 }}>
             <tr style={{ background: '#0b1829' }}>
-              {['Node', 'Zone', 'Predicted Flow (vehicle/hour)', 'Capacity', 'Util %', 'Congestion', 'Trend'].map((h) => (
+              {['Node', 'Zone', 'Current (t)', '+5s', '+10s', '+15s'].map((h) => (
                 <th key={h} style={{
-                  padding: '6px 10px',
+                  padding: '8px 10px',
                   textAlign: 'left',
                   fontSize: '0.63rem',
                   fontWeight: 700,
@@ -662,49 +665,21 @@ function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForeca
                   <td style={{ padding: '5px 10px', color: '#94a3b8', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
                     {node.zone}
                   </td>
-                  <td style={{
-                    padding: '5px 10px',
-                    fontWeight: isSelected ? 700 : 500,
-                    color: isSelected ? '#67e8f9' : '#e2e8f0',
-                    borderBottom: '1px solid rgba(255,255,255,0.03)',
-                  }}>
-                    {node.predicted_flow_veh_per_hr.toLocaleString()}
+                  <td style={{ padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)', minWidth: 80 }}>
+                    <div style={{ color: '#e2e8f0', fontWeight: 600 }}>{Math.round(node.flow_t).toLocaleString()}</div>
+                    <MiniUtilBar flow={node.flow_t} capacity={node.capacity_veh_per_hr} />
                   </td>
-                  <td style={{ padding: '5px 10px', color: '#64748b', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                    {node.capacity_veh_per_hr.toLocaleString()}
+                  <td style={{ padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)', minWidth: 80 }}>
+                    <div style={{ color: '#cbd5e1' }}>{Math.round(node.predictions?.[0] ?? 0).toLocaleString()}</div>
+                    <MiniUtilBar flow={node.predictions?.[0] ?? 0} capacity={node.capacity_veh_per_hr} />
                   </td>
-                  <td style={{ padding: '5px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                    <div style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 6,
-                    }}>
-                      <div style={{
-                        flex: 1,
-                        height: 4,
-                        borderRadius: 9999,
-                        background: 'rgba(255,255,255,0.08)',
-                        overflow: 'hidden',
-                        minWidth: 40,
-                      }}>
-                        <div style={{
-                          height: '100%',
-                          width: `${node.utilisation_pct}%`,
-                          background: node.utilisation_pct > 74 ? '#ef4444'
-                            : node.utilisation_pct > 54 ? '#f97316'
-                              : node.utilisation_pct > 29 ? '#facc15'
-                                : '#22c55e',
-                          transition: 'width 0.6s ease',
-                        }} />
-                      </div>
-                      <span style={{ color: '#94a3b8', minWidth: 30 }}>{node.utilisation_pct}%</span>
-                    </div>
+                  <td style={{ padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)', minWidth: 80 }}>
+                    <div style={{ color: '#94a3b8' }}>{Math.round(node.predictions?.[1] ?? 0).toLocaleString()}</div>
+                    <MiniUtilBar flow={node.predictions?.[1] ?? 0} capacity={node.capacity_veh_per_hr} />
                   </td>
-                  <td style={{ padding: '5px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                    <CongestionBadge level={node.congestion_level} />
-                  </td>
-                  <td style={{ padding: '5px 10px', textAlign: 'center', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                    <TrendArrow trend={node.trend} />
+                  <td style={{ padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)', minWidth: 80 }}>
+                    <div style={{ color: '#64748b' }}>{Math.round(node.predictions?.[2] ?? 0).toLocaleString()}</div>
+                    <MiniUtilBar flow={node.predictions?.[2] ?? 0} capacity={node.capacity_veh_per_hr} />
                   </td>
                 </tr>
               )
@@ -756,21 +731,7 @@ function ReportsView({ activeRun, setActiveRun, runs, isLoadingApi, apiError, hi
         <div className="glass-panel w-full flex-shrink-0 overflow-y-auto rounded-3xl border border-slate-200/15 p-6 md:w-[360px]">
           <h3 className="mb-4 font-display text-xl text-white">Run Details</h3>
           <div className="rounded-xl border border-cyan-300/20 bg-slate-900/50 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wider text-cyan-200">Connected Run</p>
-            <select
-              className="mt-2 w-full rounded-lg border border-slate-500/40 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-500"
-              value={activeRun}
-              onChange={(e) => setActiveRun(e.target.value)}
-              disabled={runs.length === 0}
-            >
-              {runs.map((runName) => (
-                <option key={runName} value={runName}>
-                  {runName}
-                </option>
-              ))}
-            </select>
-            {isLoadingApi ? <p className="mt-2 text-xs text-slate-400">Loading backend runs...</p> : null}
-            {apiError ? <p className="mt-2 text-xs text-rose-300">{apiError}</p> : null}
+            {/* Connected Run selector removed for cleaner UI */}
             <TrainingSparkline history={history} />
           </div>
 
@@ -821,6 +782,20 @@ function App() {
   const [showMetrics, setShowMetrics] = useState(true)
   const [currentView, setCurrentView] = useState('simulation')
 
+  // Simulation State
+  const [isSimulating, setIsSimulating] = useState(false)
+  const [simStep, setSimStep] = useState(0)
+
+  // Simulation ticker — only advances simStep (and therefore triggers inference)
+  // while the user has pressed "Start Real-Time Simulation".
+  useEffect(() => {
+    if (!isSimulating) return
+    const interval = setInterval(() => {
+      setSimStep((s) => s + 1)
+    }, LIVE_REFRESH_MS)
+    return () => clearInterval(interval)
+  }, [isSimulating])
+
   const network = useMemo(() => buildComplexNetwork(), [])
   const nodes = network.junctionNodes
   const edges = network.junctionEdges
@@ -844,12 +819,11 @@ function App() {
     return Array.from({ length: n }, (_, idx) => {
       const row = byIndex[idx]
       if (!row) return { flow: 0, speed: 0, congestion: 0 }
-      const flow = row.predicted_flow_veh_per_hr
+      // Use current flow_t for the map visualization so it responds instantly to sliders
+      const flow = row.flow_t
       const capacity = row.capacity_veh_per_hr
       const ratio = capacity > 0 ? clamp(flow / capacity, 0, 1) : 0
-      // Derive a [0,1] congestion score directly from utilisation ratio
-      const congestion = ratio
-      return { flow, speed: 0, congestion }
+      return { flow, speed: 0, congestion: ratio }
     })
   }, [forecastData, nodes.length])
 
@@ -865,7 +839,9 @@ function App() {
   const setSelectedNodeParam = (key, value) => {
     if (selectedNode === null || selectedNode === undefined) return
     setNodeOverrides((prev) => {
-      const current = prev[selectedNode] ?? { trafficFlow: 420, avgSpeed: 42 }
+      const forecastRow = forecastData.find((r) => r.node_index === selectedNode)
+      const defaultFlow = forecastRow ? Math.round(forecastRow.flow_t) : 500
+      const current = prev[selectedNode] ?? { trafficFlow: defaultFlow, avgSpeed: 42 }
       return {
         ...prev,
         [selectedNode]: {
@@ -936,14 +912,14 @@ function App() {
   // Default slider values for a node come from the latest model forecast
   const selectedForecastRow = forecastData.find((r) => r.node_index === selectedNode)
   const selectedState = nodeOverrides[selectedNode] ?? {
-    trafficFlow: selectedForecastRow ? Math.round(selectedForecastRow.predicted_flow_veh_per_hr) : 0,
+    trafficFlow: selectedForecastRow ? Math.round(selectedForecastRow.flow_t) : 0,
     avgSpeed: 0,
   }
   const selectedNodeName = selectedNode !== null && selectedNode !== undefined
     ? `JUNC-${String(selectedNode + 1).padStart(3, '0')}`
     : 'None'
 
-  const selectedUtil = selectedForecastRow ? selectedForecastRow.utilisation_pct : 0
+  const selectedUtil = selectedForecastRow ? (selectedForecastRow.predictions?.[0] ?? selectedForecastRow.flow_t) / (selectedForecastRow.capacity_veh_per_hr || 1) * 100 : 0
   const liveHeatPressure = Math.round(clamp(selectedUtil, 0, 100))
   const liveWeatherSeverity = Math.round((params.rain + params.wind) / 2)
   const bestVal = Number(metrics?.best_val_mse)
@@ -952,6 +928,12 @@ function App() {
   const bestEpoch = Number(metrics?.best_epoch)
   const dayFactor = toDaylightFactor(params.timeOfDay)
 
+  const resetAll = () => {
+    setParams(DEFAULTS)
+    setNodeOverrides({})
+    setIsSimulating(false)
+    setSimStep(0)
+  }
 
   return (
     <div className="h-screen overflow-hidden bg-night-grid text-slate-100">
@@ -974,15 +956,11 @@ function App() {
             className="mx-auto flex w-full max-w-[1400px] items-center justify-between px-5 pb-4 pt-6 md:px-8"
           >
             <div>
-              <p className="font-mono text-xs uppercase tracking-[0.2em] text-cyan-300/90">ST-QGCN Urban Digital Twin</p>
+              <p className="font-mono text-xs uppercase tracking-[0.2em] text-cyan-300/90">Spatiotemporal-QGCN Urban Digital Twin</p>
               <h1 className="mt-2 font-display text-3xl font-semibold leading-tight text-white md:text-4xl">
                 Chembur Network Command Deck
               </h1>
             </div>
-            {/* <div className="hidden items-center gap-3 rounded-full border border-cyan-300/30 bg-cyan-900/30 px-4 py-2 text-xs font-semibold text-cyan-100 md:flex">
-              <span className="h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_16px_#34d399]" />
-              LIVE NETWORK FEED
-            </div> */}
           </motion.header>
 
           <main className="mx-auto grid h-[calc(100vh-118px)] w-full max-w-[1400px] gap-5 px-5 pb-6 md:grid-cols-[360px_1fr] md:px-8">
@@ -994,10 +972,18 @@ function App() {
             >
               <h2 className="font-display text-xl text-white">Simulation Controls</h2>
               <p className="mt-1 text-sm text-slate-300">
-                Click any node in the network to tune local traffic behavior.
+
               </p>
 
-              {/* Connected Run selector moved to ReportsView */}
+              <div className="mt-6">
+                <button
+                  type="button"
+                  onClick={() => setIsSimulating(!isSimulating)}
+                  className={`w-full rounded-xl px-4 py-3 font-semibold transition ${isSimulating ? 'bg-rose-500/20 border border-rose-300/30 text-rose-100' : 'bg-cyan-500/10 border border-cyan-300/30 text-cyan-100'}`}
+                >
+                  {isSimulating ? `Stop Simulation (Step ${simStep})` : 'Start Real-Time Simulation'}
+                </button>
+              </div>
 
               <div className="mt-6 space-y-5">
                 <Slider label="Rain" value={params.rain} min={0} max={100} step={1} unit="%" onChange={setParam('rain')} />
@@ -1012,13 +998,14 @@ function App() {
                 <p className="mt-1 text-xs text-slate-300">Tap a node in the scene to edit local parameters.</p>
                 <div className="mt-4 space-y-4">
                   <Slider
-                    label="Traffic Density"
+                    label="Traffic Flow"
                     value={selectedState.trafficFlow}
                     min={50}
-                    max={1200}
-                    step={1}
-                    unit=" veh/km"
+                    max={2500}
+                    step={10}
+                    unit=" veh/hr"
                     onChange={(v) => setSelectedNodeParam('trafficFlow', v)}
+                    disabled={isSimulating}
                   />
                   <Slider
                     label="Avg Speed"
@@ -1028,16 +1015,14 @@ function App() {
                     step={1}
                     unit=" kmph"
                     onChange={(v) => setSelectedNodeParam('avgSpeed', v)}
+                    disabled={isSimulating}
                   />
                 </div>
               </div>
 
               <button
                 type="button"
-                onClick={() => {
-                  setParams(DEFAULTS)
-                  setNodeOverrides({})
-                }}
+                onClick={resetAll}
                 className="mt-6 w-full rounded-xl border border-cyan-300/30 bg-cyan-500/10 px-4 py-3 font-semibold text-cyan-100 transition hover:bg-cyan-500/20"
               >
                 Reset Scenario
@@ -1059,10 +1044,7 @@ function App() {
               className="glass-panel relative h-full overflow-hidden rounded-3xl border border-slate-200/15"
               style={{ display: 'flex', flexDirection: 'column' }}
             >
-              {/* 3-D canvas — takes ~58% of height */}
               <div style={{ position: 'relative', flex: '0 0 58%', overflow: 'hidden' }}>
-
-
                 <div className="h-full min-h-[320px] w-full">
                   <Canvas shadows gl={{ antialias: true }} dpr={[1, 1.8]}>
                     <PerspectiveCamera makeDefault position={[14, 14, 20]} fov={52} />
@@ -1078,14 +1060,12 @@ function App() {
                 </div>
               </div>
 
-              {/* Divider */}
               <div style={{
                 height: 1,
                 background: 'linear-gradient(90deg, transparent, rgba(103,232,249,0.25), transparent)',
                 flexShrink: 0,
               }} />
 
-              {/* Node Forecast Table — takes remaining ~42% */}
               <div style={{
                 flex: '1 1 0',
                 overflow: 'hidden',
@@ -1099,6 +1079,8 @@ function App() {
                   onForecastData={setForecastData}
                   params={params}
                   nodes={nodes}
+                  isSimulating={isSimulating}
+                  simStep={simStep}
                 />
               </div>
             </motion.section>

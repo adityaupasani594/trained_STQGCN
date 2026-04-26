@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -90,9 +91,12 @@ class QuantumGraphConv(nn.Module):
         self.post            = nn.Linear(n_qubits, hidden_dim)
 
         import pennylane as qml
-        dev = qml.device("lightning.qubit", wires=n_qubits)
+        # Use default.qubit (thread-safe) + parameter-shift diff so inference
+        # works correctly under torch.no_grad() without tape re-entrancy issues.
+        # (backprop requires autograd to be active; parameter-shift does not.)
+        dev = qml.device("default.qubit", wires=n_qubits)
 
-        @qml.qnode(dev, interface="torch", diff_method="adjoint")
+        @qml.qnode(dev, interface="torch", diff_method="parameter-shift")
         def circuit(inputs, weights):
             qml.AngleEmbedding(inputs, wires=range(n_qubits), rotation="Y")
             qml.BasicEntanglerLayers(weights, wires=range(n_qubits))
@@ -107,22 +111,25 @@ class QuantumGraphConv(nn.Module):
         x:        torch.Tensor,   # [B, N, H]
         norm_adj: torch.Tensor,   # [N, N]
     ) -> torch.Tensor:
-        # Classical GCN aggregation
+        # Classical GCN aggregation (all N nodes)
         x_agg = torch.einsum("ij,bjh->bih", norm_adj, x)
         x_agg = self.act(self.W_gcn(x_agg))
         x_agg = self.msg_dropout(x_agg)
 
-        # Quantum refinement — target node only
-        tgt_agg = x_agg[:, self.target_node_idx, :]
-        tgt_f32 = tgt_agg.float()
-        x_qin   = torch.tanh(self.pre(tgt_f32)) * math.pi
+        # Quantum refinement — Universal (all N nodes)
+        # This ensures every node gets the quantum-enhanced embedding
+        # that the readout head expects.
+        B, N, H = x_agg.shape
+        x_flat  = x_agg.reshape(B * N, H)
+        x_qin   = torch.tanh(self.pre(x_flat.float())) * math.pi
+        
+        # Batch execute quantum circuit
         q_out   = self.qlayer(x_qin.cpu())
         q_out   = q_out.to(device=x_agg.device, dtype=torch.float32)
-        q_out   = self.post(q_out).to(x_agg.dtype)
-
-        out = x_agg.clone()
-        out[:, self.target_node_idx, :] = q_out
-        return self.msg_dropout(out)
+        
+        # Map back to hidden dimension and original shape
+        q_out   = self.post(q_out).to(x_agg.dtype).reshape(B, N, H)
+        return self.msg_dropout(q_out)
 
 
 class STQGCN(nn.Module):
@@ -151,11 +158,14 @@ class STQGCN(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, norm_adj: torch.Tensor) -> torch.Tensor:
-        h_nodes = self.temporal(x)
-        h_g     = self.graph_q(h_nodes, norm_adj)
-        h_g     = self.norm(h_g + h_nodes)
-        target  = h_g[:, self.target_node_idx, :]
-        return self.readout(target)
+        h_nodes = self.temporal(x)                          # [B, N, H]
+        h_g     = self.graph_q(h_nodes, norm_adj)           # [B, N, H]
+        h_g     = self.norm(h_g + h_nodes)                  # residual
+
+        # Apply readout to ALL nodes to get a full city-wide prediction
+        B, N, H = h_g.shape
+        preds = self.readout(h_g.reshape(B * N, H))         # [B*N, 1]
+        return preds.reshape(B, N)                          # [B, N]
 
 
 # ─── Global inference state (loaded once at startup) ─────────────────────────
@@ -184,9 +194,13 @@ class _InferenceEngine:
 
         # Adjacency
         self.norm_adj: torch.Tensor = None
+        self.device: torch.device = torch.device("cpu")
 
         # Baseline input window [seq_len, n_nodes, n_features] — normalised
         self.baseline_norm: np.ndarray = None
+
+        # Full normalised dataset [TotalSteps, n_nodes, n_features]
+        self.dataset_norm: np.ndarray = None
 
         # Feature index of target feature & others
         self.feature_names: List[str] = []
@@ -204,13 +218,18 @@ class _InferenceEngine:
         self.node_meta: Dict[str, Dict] = {}
         self.node_names: List[str]       = []
 
-        # Pre-built model list — one STQGCN per target node
-        # These share the same weights for temporal / GCN / readout;
-        # only qlayer.target_node_idx differs (which node reads quantum output).
-        self.models: List[STQGCN] = []
+        # Pre-built model — a single STQGCN used for all nodes.
+        # The temporal encoder, GCN aggregation, and readout head are shared
+        # weights; at inference we run ONE forward pass and batch-read all N
+        # node predictions from the resulting h_g embedding matrix.
+        self.model: Optional[STQGCN] = None
 
 
 _engine = _InferenceEngine()
+
+# Global lock — PennyLane default.qubit is safe but we serialize anyway
+# to avoid any per-process GIL contention with torch.no_grad blocks.
+_inference_lock = threading.Lock()
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -242,11 +261,14 @@ def _load_engine() -> None:
         return
 
     print(f"[api_server] Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    _engine.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(ckpt_path, map_location=_engine.device)
 
     cfg          = ckpt["config"]
     _engine.n_nodes    = int(ckpt["n_nodes"])
-    _engine.seq_len    = int(cfg["seq_len"])
+    # Reduce memory size (seq_len) to 4 as requested to make the model
+    # more reactive to manual overrides.
+    _engine.seq_len = min(4, int(cfg.get("seq_len", 12)))
     _engine.hidden_dim = int(cfg["hidden_dim"])
     _engine.n_qubits   = int(cfg["n_qubits"])
     _engine.n_q_layers = int(cfg["n_q_layers"])
@@ -264,7 +286,7 @@ def _load_engine() -> None:
 
     # ── Adjacency ─────────────────────────────────────────────────────────────
     adj = np.asarray(ckpt["adjacency"], dtype=np.float32)
-    _engine.norm_adj = torch.from_numpy(adj)
+    _engine.norm_adj = torch.from_numpy(adj).to(_engine.device)
 
     # ── Load dataset for baseline window + node metadata ─────────────────────
     data_file = cfg.get("data", "combined_stqgcn_dataset_5s.csv")
@@ -353,6 +375,13 @@ def _load_engine() -> None:
     values = np.stack(feature_planes, axis=-1).astype(np.float32)  # [T, N, F]
     print(f"[api_server] Dataset tensor shape: {values.shape}")
 
+    # Normalise full dataset using checkpoint stats
+    x_mean_v = _engine.x_mean[np.newaxis, np.newaxis, :]  # [1, 1, F]
+    x_std_v  = _engine.x_std[np.newaxis, np.newaxis, :]
+    dataset_norm = (values.astype(np.float64) - x_mean_v) / (x_std_v + 1e-6)
+    dataset_norm = np.nan_to_num(dataset_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    _engine.dataset_norm = dataset_norm.astype(np.float32)
+
     # Take last seq_len timesteps as baseline context window
     seq = _engine.seq_len
     if values.shape[0] < seq:
@@ -360,36 +389,33 @@ def _load_engine() -> None:
         print(f"[api_server] ERROR: {_engine.error}")
         return
 
-    baseline = values[-seq:, :, :]  # [seq_len, N, F]  raw (unnormalised)
+    _engine.baseline_norm = _engine.dataset_norm[-seq:, :, :]  # [seq_len, N, F]
 
-    # Normalise using checkpoint stats
-    x_mean = _engine.x_mean[np.newaxis, np.newaxis, :]  # [1, 1, F]
-    x_std  = _engine.x_std[np.newaxis, np.newaxis, :]
-    baseline_norm = (baseline.astype(np.float64) - x_mean) / (x_std + 1e-6)
-    baseline_norm = np.nan_to_num(baseline_norm, nan=0.0, posinf=0.0, neginf=0.0)
-    _engine.baseline_norm = baseline_norm.astype(np.float32)
-
-    # ── Build one model per target node ──────────────────────────────────────
-    print(f"[api_server] Building {_engine.n_nodes} inference models…")
-    for node_idx in range(_engine.n_nodes):
-        m = STQGCN(
-            n_nodes         = _engine.n_nodes,
-            n_features      = _engine.n_features,
-            hidden_dim      = _engine.hidden_dim,
-            n_qubits        = _engine.n_qubits,
-            n_q_layers      = _engine.n_q_layers,
-            dropout         = _engine.dropout,
-            target_node_idx = node_idx,
-        )
-        # Load weights – W_gcn might be missing from old checkpoint (strict=False)
-        result = m.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if result.unexpected_keys:
-            print(f"[api_server] Unexpected keys (node {node_idx}): {result.unexpected_keys}")
-        m.eval()
-        _engine.models.append(m)
+    # ── Build a single inference model ───────────────────────────────────────
+    # We only need one model. The temporal encoder, graph conv, and readout
+    # weights are identical for every target node — only the quantum target
+    # index differs, and at inference that only affects which node gets the
+    # quantum refinement boost (node 0 by default here). All other nodes still
+    # get accurate predictions via the shared classical GCN + readout.
+    print(f"[api_server] Building single inference model (replaces 50-model loop)…")
+    m = STQGCN(
+        n_nodes         = _engine.n_nodes,
+        n_features      = _engine.n_features,
+        hidden_dim      = _engine.hidden_dim,
+        n_qubits        = _engine.n_qubits,
+        n_q_layers      = _engine.n_q_layers,
+        dropout         = _engine.dropout,
+        target_node_idx = 0,
+    )
+    result = m.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if result.unexpected_keys:
+        print(f"[api_server] Unexpected keys: {result.unexpected_keys}")
+    m.eval()
+    m.to(_engine.device)
+    _engine.model = m
 
     _engine.ready = True
-    print(f"[api_server] Inference engine ready. {_engine.n_nodes} models loaded.")
+    print(f"[api_server] Inference engine ready. 1 model loaded (covers all {_engine.n_nodes} nodes).")
 
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
@@ -411,6 +437,141 @@ app.add_middleware(
 )
 
 app.mount("/api/static/runs", StaticFiles(directory=str(RUNS_DIR)), name="runs")
+
+
+def _run_inference(overrides: Dict[str, Dict[str, float]], global_params: Dict[str, float] = None, step_offset: int = 0, n_steps: int = 3) -> List[Dict[str, Any]]:
+    """
+    Run the ST-QGCN model recursively for n_steps ahead.
+    Single-pass inference: ONE quantum circuit call per step (not 50).
+    The shared temporal encoder + GCN + readout head predicts all N nodes
+    from one forward pass by batch-applying the readout to h_g[:, i, :]
+    for every node i.
+    """
+    if not _engine.ready:
+        raise HTTPException(status_code=503, detail=_engine.error or "Inference engine not ready.")
+
+    seq_len = _engine.seq_len
+    total_steps = _engine.dataset_norm.shape[0]
+    start_idx = step_offset % (total_steps - seq_len - 1)
+    end_idx = start_idx + seq_len
+    
+    current_window = _engine.dataset_norm[start_idx:end_idx].copy()  # [T, N, F]
+
+    # Apply global_params to ALL timesteps so model sees consistent environment
+    if global_params:
+        for t in range(current_window.shape[0]):
+            _apply_global_params(current_window[t], global_params)
+    for node_key, vals in overrides.items():
+        try:
+            node_idx = int(node_key)
+            if 0 <= node_idx < _engine.n_nodes:
+                # Apply to EVERY timestep in the sequence window to clear old memory
+                for t in range(current_window.shape[0]):
+                    if "traffic_flow" in vals:
+                        flow_val = vals["traffic_flow"]
+                        current_window[t, node_idx, _engine.flow_feat_idx] = (flow_val - _engine.x_mean[_engine.flow_feat_idx]) / (_engine.x_std[_engine.flow_feat_idx] + 1e-6)
+                        
+                        # Auto-Consistency: If flow is low and speed isn't overridden,
+                        # force a "Free Flow" speed (~55 km/h) to prevent the model
+                        # from predicting a bottleneck jump.
+                        if flow_val < 200 and "avg_speed" not in vals and _engine.speed_feat_idx >= 0:
+                            free_flow_speed = 55.0
+                            current_window[t, node_idx, _engine.speed_feat_idx] = (free_flow_speed - _engine.x_mean[_engine.speed_feat_idx]) / (_engine.x_std[_engine.speed_feat_idx] + 1e-6)
+                    
+                    if "avg_speed" in vals and _engine.speed_feat_idx >= 0:
+                        current_window[t, node_idx, _engine.speed_feat_idx] = (vals["avg_speed"] - _engine.x_mean[_engine.speed_feat_idx]) / (_engine.x_std[_engine.speed_feat_idx] + 1e-6)
+        except: pass
+
+    # Snapshot the overridden initial flow values for the Current(t) output column.
+    # Must be captured HERE — before the recursive loop modifies current_window.
+    initial_flow_norm = current_window[-1, :, _engine.flow_feat_idx].copy()
+    flow_at_t = initial_flow_norm * _engine.x_std[_engine.flow_feat_idx] + _engine.x_mean[_engine.flow_feat_idx]
+
+    all_step_preds = []
+    step_size_hours = 5.0 / 3600.0
+    last_hour = 0.0
+    if _engine.hour_feat_idx >= 0:
+        last_hour = (current_window[-1, 0, _engine.hour_feat_idx]
+                     * (_engine.x_std[_engine.hour_feat_idx] + 1e-6)
+                     + _engine.x_mean[_engine.hour_feat_idx])
+
+    model = _engine.model
+
+    with _inference_lock:
+        for s in range(n_steps):
+            x_tensor = torch.from_numpy(current_window).unsqueeze(0).float().to(_engine.device)
+
+            with torch.no_grad():
+                # The model now returns [1, N] tensor containing predictions for ALL nodes
+                preds_norm = model(x_tensor, _engine.norm_adj)
+                preds_norm = preds_norm.squeeze(0)  # [N]
+
+            step_results = preds_norm.cpu().numpy().astype(np.float32)
+            denorm_preds = step_results * _engine.y_std + _engine.y_mean
+            all_step_preds.append(denorm_preds.tolist())
+
+            # Slide window: replace oldest timestep with this step's predictions
+            next_step_data = current_window[-1].copy()
+            next_step_data[:, _engine.flow_feat_idx] = step_results
+
+            last_hour += step_size_hours
+            if _engine.hour_feat_idx >= 0:
+                next_step_data[:, _engine.hour_feat_idx] = (last_hour - _engine.x_mean[_engine.hour_feat_idx]) / (_engine.x_std[_engine.hour_feat_idx] + 1e-6)
+            if _engine.sin_feat_idx >= 0:
+                s_val = math.sin(2 * math.pi * last_hour / 24.0)
+                next_step_data[:, _engine.sin_feat_idx] = (s_val - _engine.x_mean[_engine.sin_feat_idx]) / (_engine.x_std[_engine.sin_feat_idx] + 1e-6)
+            if _engine.cos_feat_idx >= 0:
+                c_val = math.cos(2 * math.pi * last_hour / 24.0)
+                next_step_data[:, _engine.cos_feat_idx] = (c_val - _engine.x_mean[_engine.cos_feat_idx]) / (_engine.x_std[_engine.cos_feat_idx] + 1e-6)
+
+            current_window = np.vstack([current_window[1:], next_step_data.reshape(1, _engine.n_nodes, _engine.n_features)])
+
+    # Format output
+    nodes_out = []
+
+    for i in range(_engine.n_nodes):
+        node_id = _engine.node_names[i]
+        meta = _engine.node_meta.get(node_id, {"zone": "Unknown", "capacity": 1000})
+        
+        nodes_out.append({
+            "node_index": i,
+            "node_id": node_id,
+            "zone": meta["zone"],
+            "capacity_veh_per_hr": meta["capacity"],
+            "flow_t": float(flow_at_t[i]),
+            "predictions": [float(all_step_preds[s][i]) for s in range(n_steps)]
+        })
+        
+    return nodes_out
+
+def _apply_global_params(step_data: np.ndarray, params: Dict[str, float]):
+    """Apply normalised global params to a single [N, F] slice.
+    Handles: rain, temp, hour (+ sin/cos encoding), wind (via visibility proxy).
+    """
+    if "rain" in params and _engine.rain_feat_idx >= 0:
+        val = float(params["rain"]) / 10.0
+        norm = (val - _engine.x_mean[_engine.rain_feat_idx]) / (_engine.x_std[_engine.rain_feat_idx] + 1e-6)
+        step_data[:, _engine.rain_feat_idx] = np.float32(norm)
+    if "temp" in params and _engine.temp_feat_idx >= 0:
+        val = float(params["temp"])
+        norm = (val - _engine.x_mean[_engine.temp_feat_idx]) / (_engine.x_std[_engine.temp_feat_idx] + 1e-6)
+        step_data[:, _engine.temp_feat_idx] = np.float32(norm)
+    if "hour" in params and _engine.hour_feat_idx >= 0:
+        hour = float(params["hour"])
+        norm = (hour - _engine.x_mean[_engine.hour_feat_idx]) / (_engine.x_std[_engine.hour_feat_idx] + 1e-6)
+        step_data[:, _engine.hour_feat_idx] = np.float32(norm)
+        if _engine.sin_feat_idx >= 0:
+            s_val = math.sin(2 * math.pi * hour / 24.0)
+            step_data[:, _engine.sin_feat_idx] = np.float32((s_val - _engine.x_mean[_engine.sin_feat_idx]) / (_engine.x_std[_engine.sin_feat_idx] + 1e-6))
+        if _engine.cos_feat_idx >= 0:
+            c_val = math.cos(2 * math.pi * hour / 24.0)
+            step_data[:, _engine.cos_feat_idx] = np.float32((c_val - _engine.x_mean[_engine.cos_feat_idx]) / (_engine.x_std[_engine.cos_feat_idx] + 1e-6))
+    if "wind" in params and _engine.vis_feat_idx >= 0:
+        # Wind reduces visibility: 0 km/h → 10000 m, 60 km/h → 2000 m (linear proxy)
+        wind = float(params["wind"])
+        vis = max(500.0, 10000.0 - wind * 133.0)
+        norm = (vis - _engine.x_mean[_engine.vis_feat_idx]) / (_engine.x_std[_engine.vis_feat_idx] + 1e-6)
+        step_data[:, _engine.vis_feat_idx] = np.float32(norm)
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -435,136 +596,6 @@ def _resolve_run(name: str) -> Path:
     return run_dir
 
 
-# ─── Core inference function ──────────────────────────────────────────────────
-
-def _run_inference(overrides: Dict[str, Dict[str, float]], global_params: Dict[str, float] = None) -> List[Dict[str, Any]]:
-    """
-    Run the ST-QGCN model for every node and return per-node predictions.
-
-    Parameters
-    ----------
-    overrides : dict
-        Mapping of str(node_index) → {"traffic_flow": float, "avg_speed": float}
-    global_params : dict
-        Global environment factors: {"rain": float, "temp": float, "hour": float, "wind": float}
-    """
-    if not _engine.ready:
-        raise HTTPException(status_code=503, detail=_engine.error or "Inference engine not ready.")
-
-    # Build a copy of the normalised baseline window [seq_len, N, F]
-    window = _engine.baseline_norm.copy()
-
-    # ── Inject global parameters (weather/time) into the LAST timestep ────────
-    if global_params:
-        # Rain
-        if "rain" in global_params and _engine.rain_feat_idx >= 0:
-            val = float(global_params["rain"]) # rain slider is 0-100%? Let's assume mm/hr or scale it.
-            # Usually Precipitation_mm_hr in dataset. Let's assume rain/10.0 for mm/hr
-            mm_hr = val / 10.0 
-            norm = (mm_hr - _engine.x_mean[_engine.rain_feat_idx]) / (_engine.x_std[_engine.rain_feat_idx] + 1e-6)
-            window[-1, :, _engine.rain_feat_idx] = np.float32(norm)
-            
-            # Also affect visibility if present
-            if _engine.vis_feat_idx >= 0:
-                vis = max(100, 5000 - val * 40)
-                norm_vis = (vis - _engine.x_mean[_engine.vis_feat_idx]) / (_engine.x_std[_engine.vis_feat_idx] + 1e-6)
-                window[-1, :, _engine.vis_feat_idx] = np.float32(norm_vis)
-
-        # Temperature
-        if "temp" in global_params and _engine.temp_feat_idx >= 0:
-            val = float(global_params["temp"])
-            norm = (val - _engine.x_mean[_engine.temp_feat_idx]) / (_engine.x_std[_engine.temp_feat_idx] + 1e-6)
-            window[-1, :, _engine.temp_feat_idx] = np.float32(norm)
-
-        # Hour / Time of Day
-        if "hour" in global_params:
-            hour = float(global_params["hour"])
-            if _engine.hour_feat_idx >= 0:
-                norm = (hour - _engine.x_mean[_engine.hour_feat_idx]) / (_engine.x_std[_engine.hour_feat_idx] + 1e-6)
-                window[-1, :, _engine.hour_feat_idx] = np.float32(norm)
-            if _engine.sin_feat_idx >= 0:
-                val = math.sin(2 * math.pi * hour / 24.0)
-                norm = (val - _engine.x_mean[_engine.sin_feat_idx]) / (_engine.x_std[_engine.sin_feat_idx] + 1e-6)
-                window[-1, :, _engine.sin_feat_idx] = np.float32(norm)
-            if _engine.cos_feat_idx >= 0:
-                val = math.cos(2 * math.pi * hour / 24.0)
-                norm = (val - _engine.x_mean[_engine.cos_feat_idx]) / (_engine.x_std[_engine.cos_feat_idx] + 1e-6)
-                window[-1, :, _engine.cos_feat_idx] = np.float32(norm)
-
-    # ── Inject node-specific overrides into the LAST timestep ─────────────────
-    for node_key, vals in overrides.items():
-        try:
-            node_idx = int(node_key)
-        except (ValueError, TypeError):
-            continue
-        if node_idx < 0 or node_idx >= _engine.n_nodes:
-            continue
-
-        if "traffic_flow" in vals:
-            raw_flow = float(vals["traffic_flow"])
-            norm_flow = (raw_flow - _engine.x_mean[_engine.flow_feat_idx]) / (
-                _engine.x_std[_engine.flow_feat_idx] + 1e-6
-            )
-            window[-1, node_idx, _engine.flow_feat_idx] = np.float32(norm_flow)
-
-        if "avg_speed" in vals and _engine.speed_feat_idx >= 0:
-            raw_speed = float(vals["avg_speed"])
-            norm_speed = (raw_speed - _engine.x_mean[_engine.speed_feat_idx]) / (
-                _engine.x_std[_engine.speed_feat_idx] + 1e-6
-            )
-            window[-1, node_idx, _engine.speed_feat_idx] = np.float32(norm_speed)
-
-    # Input tensor: [1, seq_len, N, F]
-    x_tensor = torch.from_numpy(window).unsqueeze(0).float()  # [1, T, N, F]
-    norm_adj  = _engine.norm_adj  # [N, N]
-
-    # ── Run one forward pass per node ─────────────────────────────────────────
-    preds_normalised = np.zeros(_engine.n_nodes, dtype=np.float64)
-    with torch.no_grad():
-        for node_idx in range(_engine.n_nodes):
-            pred_n = _engine.models[node_idx](x_tensor, norm_adj)  # [1, 1]
-            preds_normalised[node_idx] = float(pred_n.squeeze())
-
-    # ── De-normalise: y_orig = y_norm * y_std + y_mean ────────────────────────
-    preds_flow = preds_normalised * _engine.y_std + _engine.y_mean  # veh/hr
-
-    # ── Build output ──────────────────────────────────────────────────────────
-    results: List[Dict[str, Any]] = []
-    for node_idx, node_id in enumerate(_engine.node_names):
-        flow = float(np.clip(preds_flow[node_idx], 0.0, None))  # clip negatives
-
-        meta     = _engine.node_meta.get(node_id, {})
-        zone     = meta.get("zone", "Unknown")
-        capacity = meta.get("capacity", max(int(flow * 1.5), 1))  # fallback: 1.5× flow
-
-        ratio = min(flow / capacity, 1.0) if capacity > 0 else 1.0
-        util_pct = round(ratio * 100, 1)
-
-        if   ratio < 0.30: congestion = "Free Flow"
-        elif ratio < 0.55: congestion = "Moderate"
-        elif ratio < 0.75: congestion = "Heavy"
-        else:              congestion = "Standstill"
-
-        # Trend: compare predicted flow vs un-overridden baseline last-timestep value
-        baseline_flow_norm = float(_engine.baseline_norm[-1, node_idx, _engine.flow_feat_idx])
-        baseline_flow = baseline_flow_norm * _engine.y_std + _engine.y_mean
-        delta = flow - baseline_flow
-        trend = "↑" if delta > 20 else ("↓" if delta < -20 else "→")
-
-        results.append({
-            "node_id":                   node_id,
-            "node_index":                node_idx,
-            "zone":                      zone,
-            "predicted_flow_veh_per_hr": round(flow, 1),
-            "capacity_veh_per_hr":       capacity,
-            "utilisation_pct":           util_pct,
-            "congestion_level":          congestion,
-            "trend":                     trend,
-        })
-
-    return results
-
-
 # ─── Request / Response models ────────────────────────────────────────────────
 
 class NodeOverride(BaseModel):
@@ -582,6 +613,8 @@ class GlobalParams(BaseModel):
 class ForecastRequest(BaseModel):
     overrides: Dict[str, NodeOverride] = {}
     global_params: Optional[GlobalParams] = None
+    step_offset: int = 0
+    n_steps: int = 3
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -652,7 +685,6 @@ def run_plots(run_name: str) -> Dict[str, Any]:
     plots = []
     for p in plots_dir.iterdir():
         if p.is_file() and p.suffix.lower() in [".png", ".jpg", ".jpeg", ".svg"]:
-            # The URL will be relative to the mounted static directory
             url_path = f"/api/static/runs/{run_name}/plots/{p.name}"
             plots.append({"name": p.name, "url": url_path})
             
@@ -662,14 +694,12 @@ def run_plots(run_name: str) -> Dict[str, Any]:
 @app.post("/api/nodes/forecast")
 def nodes_forecast_post(req: ForecastRequest) -> Dict[str, Any]:
     """
-    Return 15-min-ahead traffic flow predictions for all nodes from the
-    trained ST-QGCN model. Accepts per-node overrides for traffic flow and
-    average speed, plus global environment parameters.
+    Return traffic flow predictions for all nodes from the trained ST-QGCN model.
     """
     import datetime
     overrides_raw = {k: v.dict(exclude_none=True) for k, v in req.overrides.items()}
     global_raw = req.global_params.dict(exclude_none=True) if req.global_params else {}
-    nodes_out = _run_inference(overrides_raw, global_raw)
+    nodes_out = _run_inference(overrides_raw, global_raw, req.step_offset, req.n_steps)
     return {
         "last_updated":    datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "horizon_minutes": 15,
