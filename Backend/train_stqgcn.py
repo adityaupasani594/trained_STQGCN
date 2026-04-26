@@ -34,6 +34,7 @@ import json
 import math
 import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -129,6 +130,9 @@ def load_table(
 
         feature_planes: List[np.ndarray] = []
         for feat in feature_names:
+            # ---> ADD THIS LINE <---
+            wide[feat] = pd.to_numeric(wide[feat], errors="coerce")
+
             p = wide.pivot_table(
                 index=time_col,
                 columns=node_col,
@@ -520,10 +524,8 @@ def to_loaders(
 def eval_model(
     model:     nn.Module,
     loader:    DataLoader,
-    criterion: nn.Module,
     norm_adj:  torch.Tensor,
     device:    torch.device,
-    scaler:    "torch.cuda.amp.GradScaler | None" = None,
 ) -> Tuple[float, float]:
     model.eval()
     mse_sum = mae_sum = count = 0.0
@@ -538,7 +540,7 @@ def eval_model(
         if not torch.isfinite(pred).all() or not torch.isfinite(yb).all():
             invalid_batches += 1
             continue
-        mse_sum += criterion(pred, yb).item() * xb.shape[0]
+        mse_sum += torch.mean((pred - yb) ** 2).item() * xb.shape[0]
         mae_sum += torch.mean(torch.abs(pred - yb)).item() * xb.shape[0]
         count   += xb.shape[0]
 
@@ -550,6 +552,200 @@ def eval_model(
 
 def denorm_metrics(mse_n: float, mae_n: float, y_std: float) -> Tuple[float, float]:
     return float(mse_n * y_std ** 2), float(mae_n * y_std)
+
+
+def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if y_true.size == 0 or y_pred.size == 0:
+        return float("nan")
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    mean_t = float(np.mean(y_true))
+    ss_tot = float(np.sum((y_true - mean_t) ** 2))
+    if ss_tot <= 1e-12:
+        return float("nan")
+    return 1.0 - (ss_res / ss_tot)
+
+
+@torch.no_grad()
+def collect_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    norm_adj: torch.Tensor,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    y_true_list: List[np.ndarray] = []
+    y_pred_list: List[np.ndarray] = []
+
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            pred = model(xb, norm_adj).float()
+
+        y_true_list.append(yb.cpu().numpy().reshape(-1))
+        y_pred_list.append(pred.cpu().numpy().reshape(-1))
+
+    if not y_true_list:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    y_true = np.concatenate(y_true_list).astype(np.float64)
+    y_pred = np.concatenate(y_pred_list).astype(np.float64)
+    return y_true, y_pred
+
+
+@torch.no_grad()
+def benchmark_inference_latency(
+    model: nn.Module,
+    norm_adj: torch.Tensor,
+    sample_x: torch.Tensor,
+    device: torch.device,
+    n_nodes: int,
+    warmup_runs: int,
+    measure_runs: int,
+    use_amp: bool,
+) -> Dict[str, float]:
+    model.eval()
+
+    xb = sample_x.to(device, non_blocking=True)
+
+    # Warmup to stabilise kernels/caches.
+    for _ in range(max(warmup_runs, 0)):
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            _ = model(xb, norm_adj)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+    single_pass_times: List[float] = []
+    full_network_times: List[float] = []
+
+    for _ in range(max(measure_runs, 1)):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            _ = model(xb, norm_adj)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        single_pass_times.append((t1 - t0) * 1000.0)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        for _node_idx in range(n_nodes):
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                _ = model(xb, norm_adj)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        full_network_times.append(t3 - t2)
+
+    single_arr = np.asarray(single_pass_times, dtype=np.float64)
+    full_arr = np.asarray(full_network_times, dtype=np.float64)
+
+    return {
+        "single_pass_mean_ms": float(np.mean(single_arr)),
+        "single_pass_p95_ms": float(np.percentile(single_arr, 95)),
+        "full_network_mean_sec": float(np.mean(full_arr)),
+        "full_network_p95_sec": float(np.percentile(full_arr, 95)),
+    }
+
+
+def save_training_graphs(
+    history_df: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    plots_dir: Path,
+    max_points: int,
+) -> None:
+    # Import lazily so training still works even if plotting dependencies are missing.
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"Warning: plotting skipped (matplotlib unavailable: {exc})")
+        return
+
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Epoch-wise loss graph.
+    fig = plt.figure(figsize=(11, 5))
+    plt.plot(history_df["epoch"], history_df["train_mse"], label="Training MSE", linewidth=2)
+    plt.plot(history_df["epoch"], history_df["val_mse"], label="Validation MSE", linewidth=2)
+    if "train_mae" in history_df.columns:
+        plt.plot(history_df["epoch"], history_df["train_mae"], label="Training MAE", alpha=0.7)
+    plt.title("Training and Validation Curves")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(plots_dir / "training_validation_curves.png", dpi=180)
+    plt.close(fig)
+
+    # 2) Learning rate schedule.
+    fig = plt.figure(figsize=(10, 4.8))
+    plt.plot(history_df["epoch"], history_df["lr"], color="#8b5cf6", linewidth=2)
+    plt.yscale("log")
+    plt.title("Learning Rate Schedule")
+    plt.xlabel("Epoch")
+    plt.ylabel("Learning Rate (log scale)")
+    plt.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plots_dir / "learning_rate_schedule.png", dpi=180)
+    plt.close(fig)
+
+    if y_true.size == 0 or y_pred.size == 0:
+        return
+
+    # Downsample for readability.
+    n = min(len(y_true), max_points)
+    idx = np.linspace(0, len(y_true) - 1, num=n, dtype=np.int64)
+    y_true_s = y_true[idx]
+    y_pred_s = y_pred[idx]
+    residuals = y_pred_s - y_true_s
+
+    # 3) Prediction vs actual over sample index.
+    fig = plt.figure(figsize=(12, 5.5))
+    plt.plot(y_true_s, label="Actual", linewidth=1.8, alpha=0.9)
+    plt.plot(y_pred_s, label="Predicted", linewidth=1.4, alpha=0.85)
+    plt.title("Sample Prediction Comparison")
+    plt.xlabel("Sample Index")
+    plt.ylabel("Traffic Flow")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(plots_dir / "sample_prediction_comparison.png", dpi=180)
+    plt.close(fig)
+
+    # 4) Scatter quality graph.
+    fig = plt.figure(figsize=(6.6, 6.2))
+    plt.scatter(y_true_s, y_pred_s, s=12, alpha=0.45, color="#0284c7", edgecolors="none")
+    min_v = float(min(np.min(y_true_s), np.min(y_pred_s)))
+    max_v = float(max(np.max(y_true_s), np.max(y_pred_s)))
+    plt.plot([min_v, max_v], [min_v, max_v], "r--", linewidth=1.5, label="Ideal")
+    plt.title("Predicted vs Actual Scatter")
+    plt.xlabel("Actual")
+    plt.ylabel("Predicted")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(plots_dir / "predicted_vs_actual_scatter.png", dpi=180)
+    plt.close(fig)
+
+    # 5) Residual distribution.
+    fig = plt.figure(figsize=(9.2, 4.8))
+    plt.hist(residuals, bins=45, color="#0ea5e9", alpha=0.85, edgecolor="white")
+    plt.axvline(0.0, color="red", linestyle="--", linewidth=1.5)
+    plt.title("Residual Distribution")
+    plt.xlabel("Residual (Predicted - Actual)")
+    plt.ylabel("Count")
+    plt.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(plots_dir / "residual_distribution.png", dpi=180)
+    plt.close(fig)
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -574,6 +770,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size",   type=int,   default=32)
     p.add_argument("--lr",           type=float, default=1.5e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
+    p.add_argument("--loss",         default="huber", choices=["mse", "huber"],
+                   help="Training loss function. Huber is often more stable with traffic outliers.")
+    p.add_argument("--huber-delta",  type=float, default=1.0,
+                   help="Delta parameter for Huber loss when --loss huber is selected.")
     p.add_argument("--train-ratio",  type=float, default=0.8)
     p.add_argument("--num-workers",  type=int,   default=2,
                    help="DataLoader worker processes (OPT-7). Set 0 to disable.")
@@ -591,7 +791,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-patience",  type=int,   default=20)
     p.add_argument("--early-stop-min-delta", type=float, default=1e-4)
     p.add_argument("--seed",                 type=int,   default=42)
-    p.add_argument("--runs-dir",             default="runs/stqgcn")
+    p.add_argument("--runs-dir",             default="runs/stqgcn_allfeatures")
+    p.add_argument("--latency-budget-sec",   type=float, default=5.0,
+                   help="Target upper bound for full-network inference latency (seconds).")
+    p.add_argument("--latency-warmup-runs",  type=int,   default=5,
+                   help="Warmup runs before latency measurement.")
+    p.add_argument("--latency-benchmark-runs", type=int, default=20,
+                   help="Measured runs for latency benchmark.")
+    p.add_argument("--plot-max-points",      type=int, default=600,
+                   help="Max points shown in prediction plots.")
     p.add_argument("--no-compile",           action="store_true",
                    help="Disable torch.compile (OPT-5). Use if PyTorch < 2.0.")
     p.add_argument("--no-amp",               action="store_true",
@@ -734,7 +942,11 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, min_lr=args.lr * 0.05
     )
-    criterion = nn.MSELoss()
+    criterion: nn.Module
+    if args.loss == "huber":
+        criterion = nn.HuberLoss(delta=args.huber_delta)
+    else:
+        criterion = nn.MSELoss()
 
     # OPT-6: AMP GradScaler — use updated API, fall back for older PyTorch
     try:
@@ -745,9 +957,13 @@ def main() -> None:
     # ── Output paths ──────────────────────────────────────────────────────────
     runs_dir     = Path(args.runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir    = runs_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
     best_path    = runs_dir / "best_stqgcn.pt"
     history_path = runs_dir / "training_history.json"
+    history_csv_path = runs_dir / "training_history.csv"
     metrics_path = runs_dir / "metrics.json"
+    test_pred_csv_path = runs_dir / "test_predictions.csv"
 
     # ── Training loop ─────────────────────────────────────────────────────────
     best_val_mse     = float("inf")
@@ -758,6 +974,8 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_mse_sum = train_count = 0
+        train_mae_sum = 0.0
+        train_loss_sum = 0.0
 
         pbar = tqdm(
             train_loader,
@@ -770,7 +988,8 @@ def main() -> None:
 
             # OPT-6: AMP forward pass
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                loss = criterion(model(xb, norm_adj).float(), yb)
+                pred = model(xb, norm_adj).float()
+                loss = criterion(pred, yb)
 
             if not torch.isfinite(loss):
                 continue
@@ -782,23 +1001,27 @@ def main() -> None:
             scaler.update()
 
             bs             = xb.shape[0]
-            train_mse_sum += loss.item() * bs
+            train_loss_sum += loss.item() * bs
+            train_mse_sum += torch.mean((pred.detach() - yb) ** 2).item() * bs
+            train_mae_sum += torch.mean(torch.abs(pred.detach() - yb)).item() * bs
             train_count   += bs
             pbar.set_postfix(
                 train_mse=f"{train_mse_sum / max(train_count, 1):.5f}"
             )
 
+        train_loss       = train_loss_sum / max(train_count, 1)
         train_mse        = train_mse_sum / max(train_count, 1)
-        val_mse, val_mae = eval_model(
-            model, val_loader, criterion, norm_adj, device
-        )
+        train_mae        = train_mae_sum / max(train_count, 1)
+        val_mse, val_mae = eval_model(model, val_loader, norm_adj, device)
 
         scheduler.step(val_mse)
 
         current_lr = optimizer.param_groups[0]["lr"]
         history.append({
             "epoch":     epoch,
+            "train_loss": float(train_loss),
             "train_mse": float(train_mse),
+            "train_mae": float(train_mae),
             "val_mse":   float(val_mse),
             "val_mae":   float(val_mae),
             "lr":        current_lr,
@@ -832,7 +1055,8 @@ def main() -> None:
             no_improve_count += 1
 
         print(
-            f"Epoch {epoch:03d} | train_mse={train_mse:.6f} | "
+            f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | train_mse={train_mse:.6f} | "
+            f"train_mae={train_mae:.6f} | "
             f"val_mse={val_mse:.6f} | val_mae={val_mae:.6f} | lr={current_lr:.2e}"
             + (" ✓" if improved else "")
         )
@@ -861,27 +1085,70 @@ def main() -> None:
     else:
         print("Warning: no best checkpoint was saved; using current model weights.")
 
-    test_mse_n, test_mae_n = eval_model(
-        model, test_loader, criterion, norm_adj, device
-    )
+    test_mse_n, test_mae_n = eval_model(model, test_loader, norm_adj, device)
+
+    y_true_n, y_pred_n = collect_predictions(model, test_loader, norm_adj, device)
 
     y_std                = float(np.asarray(stats["y_std"]).reshape(-1)[0])
+    y_mean               = float(np.asarray(stats.get("y_mean", 0.0)).reshape(-1)[0])
     best_val_mse_orig, _ = denorm_metrics(best_val_mse, 0.0, y_std)
     test_mse_orig, test_mae_orig = denorm_metrics(test_mse_n, test_mae_n, y_std)
+    y_true_orig = y_true_n * y_std + y_mean
+    y_pred_orig = y_pred_n * y_std + y_mean
+    test_r2_orig = _safe_r2(y_true_orig, y_pred_orig)
+
+    sample_x = torch.from_numpy(split.x_test[:1]).float()
+    latency = benchmark_inference_latency(
+        model=model,
+        norm_adj=norm_adj,
+        sample_x=sample_x,
+        device=device,
+        n_nodes=n_nodes,
+        warmup_runs=args.latency_warmup_runs,
+        measure_runs=args.latency_benchmark_runs,
+        use_amp=use_amp,
+    )
+    latency_budget_ok = latency["full_network_p95_sec"] <= float(args.latency_budget_sec)
 
     metrics = {
         "best_val_mse": best_val_mse_orig,
         "test_mse":     test_mse_orig,
         "test_mae":     test_mae_orig,
+        "test_r2":      test_r2_orig,
         "epochs_run":   len(history),
         "best_epoch":   best_epoch,
         "batch_size":   args.batch_size,
         "device":       str(device),
         "scaler":       args.scaler,
+        "loss":         args.loss,
+        "huber_delta":  args.huber_delta,
+        "latency_budget_sec": float(args.latency_budget_sec),
+        "latency_single_pass_mean_ms": latency["single_pass_mean_ms"],
+        "latency_single_pass_p95_ms": latency["single_pass_p95_ms"],
+        "latency_full_network_mean_sec": latency["full_network_mean_sec"],
+        "latency_full_network_p95_sec": latency["full_network_p95_sec"],
+        "latency_budget_pass": latency_budget_ok,
     }
 
     with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+    pd.DataFrame(history).to_csv(history_csv_path, index=False)
+
+    pred_df = pd.DataFrame({
+        "actual": y_true_orig,
+        "predicted": y_pred_orig,
+        "residual": y_pred_orig - y_true_orig,
+    })
+    pred_df.to_csv(test_pred_csv_path, index=False)
+
+    save_training_graphs(
+        history_df=pd.DataFrame(history),
+        y_true=y_true_orig,
+        y_pred=y_pred_orig,
+        plots_dir=plots_dir,
+        max_points=args.plot_max_points,
+    )
+
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
@@ -889,9 +1156,15 @@ def main() -> None:
     print(f"  Best val MSE (original scale): {best_val_mse_orig:.4f}")
     print(f"  Test  MSE   (original scale): {test_mse_orig:.4f}")
     print(f"  Test  MAE   (original scale): {test_mae_orig:.4f}")
+    print(f"  Test  R2    (original scale): {test_r2_orig:.4f}")
+    print(f"  Full network latency p95 (sec): {latency['full_network_p95_sec']:.4f}")
+    print(f"  Latency budget ({args.latency_budget_sec:.2f}s): {'PASS' if latency_budget_ok else 'FAIL'}")
     print(f"  Saved best model → {best_path}")
     print(f"  Saved history    → {history_path}")
+    print(f"  Saved history csv→ {history_csv_path}")
+    print(f"  Saved test preds → {test_pred_csv_path}")
     print(f"  Saved metrics    → {metrics_path}")
+    print(f"  Saved plots      → {plots_dir}")
 
 
 if __name__ == "__main__":

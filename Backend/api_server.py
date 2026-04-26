@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ─── Model definition (must match the saved checkpoint exactly) ──────────────
@@ -339,6 +340,10 @@ def _load_engine() -> None:
 
     feature_planes: List[np.ndarray] = []
     for feat in feature_names:
+
+        # ---> ADD THIS LINE <---
+        wide[feat] = pd.to_numeric(wide[feat], errors="coerce")
+
         p = wide.pivot_table(index=time_col, columns=node_col, values=feat, aggfunc="mean")
         p = p.reindex(index=time_values, columns=node_names_sorted)
         p = p.apply(pd.to_numeric, errors="coerce")
@@ -404,6 +409,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.mount("/api/static/runs", StaticFiles(directory=str(RUNS_DIR)), name="runs")
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -633,6 +640,23 @@ def run_history(run_name: str) -> Dict[str, Any]:
     if not isinstance(history, list):
         raise HTTPException(status_code=500, detail="History payload is not a list")
     return {"run": run_name, "history": history}
+
+
+@app.get("/api/runs/{run_name}/plots")
+def run_plots(run_name: str) -> Dict[str, Any]:
+    run_dir = _resolve_run(run_name)
+    plots_dir = run_dir / "plots"
+    if not plots_dir.exists() or not plots_dir.is_dir():
+        return {"run": run_name, "plots": []}
+    
+    plots = []
+    for p in plots_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in [".png", ".jpg", ".jpeg", ".svg"]:
+            # The URL will be relative to the mounted static directory
+            url_path = f"/api/static/runs/{run_name}/plots/{p.name}"
+            plots.append({"name": p.name, "url": url_path})
+            
+    return {"run": run_name, "plots": plots}
 
 
 @app.post("/api/nodes/forecast")
