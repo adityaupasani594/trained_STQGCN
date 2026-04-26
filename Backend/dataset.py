@@ -2,6 +2,12 @@
 Vectorised ST-QGCN large dataset generator.
 50 nodes, 8 weeks at 15-min resolution = 2,688 timesteps.
 134,400 node-time records. Uses write_only xlsx for speed.
+
+Mathematical Foundation (aligned with Math Model PDF):
+- x_{i,t}: Raw traffic features [Flow, Speed, Occupancy, Queue]
+- e_{ji,t}: Edge features [Capacity, Length, Quality, Speed Limit, Lane Count, Incident Flag]
+- w_{i,t}: Weather features [Precipitation, Visibility, Temperature]
+- tau_t: Temporal features [Hour, Day of Week, Holiday, Special Event]
 """
 import numpy as np
 import pandas as pd
@@ -142,6 +148,7 @@ df_temporal = pd.DataFrame({
     "Special_Event": [1 if (t.weekday()==5 and 18<=t.hour<=22) else 0 for t in timestamps],
 })
 
+# ── Dataframes Assembly (aligned with PDF variable groups) ─────────────────────
 df_topo = pd.DataFrame({
     "Node_ID":node_ids,"Zone":zones,"Latitude":node_lat,"Longitude":node_lon,
     "Intersection_Type":types,"Capacity_veh_hr":capacity.astype(int),
@@ -197,7 +204,7 @@ with pd.ExcelWriter(OUT, engine="openpyxl") as writer:
         ws.freeze_panes = "B2"
         ws.auto_filter.ref = ws.dimensions
 
-print(f"\nSaved → {OUT}")
+print(f"\nSaved -> {OUT}")
 print(f"Node-time rows  : {N_NODES*T_STEPS:,}")
 print(f"Edge-time rows  : {N_EDGES*T_STEPS:,}")
 print(f"Train windows   : ~{int((T_STEPS-96-1)*0.8):,}  (seq_len=96)")

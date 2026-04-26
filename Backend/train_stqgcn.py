@@ -7,12 +7,9 @@ OPT-1. Target-node-only quantum execution
          — quantum circuit runs B times per batch (not B×N).
          — 50× fewer circuit calls → ~50× faster per batch.
 OPT-2. diff_method="adjoint" on lightning.qubit
-         — adjoint differentiation is O(gates) vs O(params²) for
-           parameter-shift; ~5–10× faster backward pass.
+         — adjoint differentiation is O(gates) vs O(params²) for parameter-shift; ~5–10× faster backward pass.
 OPT-3. Classical GCN aggregation still covers all N nodes
-         — only the readout node's aggregated embedding enters the
-           quantum layer; all graph structure is preserved via pre-
-           aggregation before the quantum step.
+         — only the readout node's aggregated embedding enters the quantum layer; all graph structure is preserved via pre-aggregation before the quantum step.
 OPT-4. Gradient checkpointing on TemporalEncoder
          — reduces peak GPU memory for large N/seq_len.
 OPT-5. torch.compile (optional, PyTorch ≥ 2.0)
@@ -49,11 +46,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Data classes
 # ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class SplitData:
     x_train: np.ndarray
@@ -70,19 +65,14 @@ class PreparedTensorData:
     node_names: List[str]
     feature_names: List[str]
     target_feature_idx: int
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Utilities
 # ─────────────────────────────────────────────────────────────────────────────
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
 def load_table(
     path: Path,
     sheet_name: str,
@@ -157,7 +147,6 @@ def load_table(
             feature_names=feature_names,
             target_feature_idx=feature_names.index(value_col),
         )
-
         # Combined CSV format: long table with timestamp + node + many features.
         # Build the same [T, N] value matrix expected by the current ST-QGCN pipeline.
         required = {time_col, node_col, value_col}
@@ -227,7 +216,6 @@ def load_table(
         target_feature_idx=0,
     )
 
-
 def make_sliding_windows(
     values: np.ndarray,
     target_node_idx: int,
@@ -242,7 +230,6 @@ def make_sliding_windows(
     """
     if values.ndim != 3:
         raise ValueError(f"Expected values shape [T, N, F], got {values.shape}")
-
     n_rows = values.shape[0]
     max_start = n_rows - seq_len - horizon + 1
     if max_start <= 0:
@@ -354,12 +341,9 @@ def correlation_adjacency(
     deg_inv_sqrt = np.power(np.clip(deg, 1e-12, None), -0.5)
     d_mat        = np.diag(deg_inv_sqrt)
     return (d_mat @ adj @ d_mat).astype(np.float32)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Model
 # ─────────────────────────────────────────────────────────────────────────────
-
 class TemporalEncoder(nn.Module):
     """
     Per-node 1-D temporal convolution.
@@ -386,20 +370,14 @@ class TemporalEncoder(nn.Module):
         return self.norm(h)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # OPT-4: gradient checkpointing to save GPU memory
         if self.training and x.requires_grad:
             return torch.utils.checkpoint.checkpoint(self._encode, x, use_reentrant=False)
         return self._encode(x)
 
-
 class QuantumGraphConv(nn.Module):
     """
-    Quantum-enhanced GCN layer — OPT-1: quantum circuit runs on the
-    target node's aggregated embedding only (B calls/batch, not B×N).
-
-    Full graph structure is preserved: all N nodes participate in the
-    classical GCN aggregation step before the quantum refinement.
-
+    Quantum-enhanced GCN layer — OPT-1: quantum circuit runs on the target node's aggregated embedding only (B calls/batch, not B×N).
+    Full graph structure is preserved: all N nodes participate in the classical GCN aggregation step before the quantum refinement.
     Input / output: [B, N, H]
     """
     def __init__(
@@ -456,12 +434,10 @@ class QuantumGraphConv(nn.Module):
         q_out    = self.qlayer(x_qin.cpu())                  # [B, n_qubits] on CPU
         q_out    = q_out.to(device=x_agg.device, dtype=torch.float32)  # → CUDA
         q_out    = self.post(q_out).to(x_agg.dtype)         # [B, H]
-
         # Write quantum-refined embedding back into the target node slot
         out                          = x_agg.clone()
         out[:, self.target_node_idx, :] = q_out
         return self.msg_dropout(out)                        # [B, N, H]
-
 
 class STQGCN(nn.Module):
     """
@@ -509,11 +485,9 @@ class STQGCN(nn.Module):
         target = h_g[:, self.target_node_idx, :]            # [B, H]
         return self.readout(target)                         # [B, 1]
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Training helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
 def to_loaders(
     split: SplitData,
     batch_size: int,
@@ -541,7 +515,6 @@ def to_loaders(
         batch_size=batch_size, shuffle=False, **common
     )
     return train_loader, val_loader, test_loader
-
 
 @torch.no_grad()
 def eval_model(
@@ -577,12 +550,9 @@ def eval_model(
 
 def denorm_metrics(mse_n: float, mae_n: float, y_std: float) -> Tuple[float, float]:
     return float(mse_n * y_std ** 2), float(mae_n * y_std)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  CLI
 # ─────────────────────────────────────────────────────────────────────────────
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train ST-QGCN (optimised)")
 
@@ -628,12 +598,9 @@ def parse_args() -> argparse.Namespace:
                    help="Disable AMP (OPT-6). Use if GPU does not support fp16.")
 
     return p.parse_args()
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
-
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)

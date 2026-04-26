@@ -340,9 +340,8 @@ function NetworkScene({ params, selectedNode, onNodeSelect, network, nodeState, 
       })}
 
       {nodes.map((n, idx) => {
-        const seed = ((idx * 37) % 100) / 100
-        const congestion = nodeState[idx].congestion
-        const heat = clamp(seed * 0.2 + congestion * 0.75 + networkLoad * 0.18, 0, 1)
+        const congestion = nodeState[idx]?.congestion ?? 0
+        const heat = clamp(congestion, 0, 1)
         const isSelected = selectedNode === idx
 
         return (
@@ -358,11 +357,11 @@ function NetworkScene({ params, selectedNode, onNodeSelect, network, nodeState, 
               onNodeSelect(idx)
             }}
           >
-            <sphereGeometry args={[0.28 + heat * 0.2 + (isSelected ? 0.08 : 0), 20, 20]} />
+            <sphereGeometry args={[0.3 + heat * 0.25 + (isSelected ? 0.1 : 0), 20, 20]} />
             <meshStandardMaterial
               color={isSelected ? '#d6f6ff' : heatColor(heat)}
               emissive={heatColor(heat)}
-              emissiveIntensity={0.25 + heat * 0.68 + (isSelected ? 0.2 : 0)}
+              emissiveIntensity={0.3 + heat * 0.7 + (isSelected ? 0.3 : 0)}
               roughness={0.35}
               metalness={0.2}
             />
@@ -451,6 +450,275 @@ function apiUrl(path) {
   return path
 }
 
+// ── Congestion colour helper ───────────────────────────────────────────────────
+const CONG_STYLE = {
+  'Free Flow': { bg: 'rgba(34,197,94,0.18)', text: '#86efac', border: 'rgba(34,197,94,0.4)' },
+  'Moderate': { bg: 'rgba(234,179,8,0.18)', text: '#fde047', border: 'rgba(234,179,8,0.4)' },
+  'Heavy': { bg: 'rgba(249,115,22,0.18)', text: '#fb923c', border: 'rgba(249,115,22,0.4)' },
+  'Standstill': { bg: 'rgba(239,68,68,0.18)', text: '#f87171', border: 'rgba(239,68,68,0.4)' },
+}
+
+function CongestionBadge({ level }) {
+  const s = CONG_STYLE[level] ?? CONG_STYLE['Moderate']
+  return (
+    <span style={{
+      background: s.bg,
+      color: s.text,
+      border: `1px solid ${s.border}`,
+      borderRadius: '9999px',
+      padding: '1px 8px',
+      fontSize: '0.68rem',
+      fontWeight: 700,
+      letterSpacing: '0.04em',
+      whiteSpace: 'nowrap',
+    }}>
+      {level}
+    </span>
+  )
+}
+
+function TrendArrow({ trend }) {
+  const map = { '↑': '#22d3ee', '↓': '#f87171', '→': '#94a3b8' }
+  return (
+    <span style={{ color: map[trend] ?? '#94a3b8', fontWeight: 700, fontSize: '1rem' }}>
+      {trend}
+    </span>
+  )
+}
+
+function NodeForecastTable({ selectedNode, onNodeSelect, nodeOverrides, onForecastData, params, nodes }) {
+  const [forecast, setForecast] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [inferring, setInferring] = useState(false)
+  const [lastTs, setLastTs] = useState('')
+  const rowRefs = useRef({})
+  const debounceRef = useRef(null)
+  const autoRefreshRef = useRef(null)
+
+  // POST overrides to the model and receive real predictions
+  const fetchWithOverrides = async (overridesPayload, globalParams, isBackground = false) => {
+    if (!isBackground) setInferring(true)
+    try {
+      // Translate nodeOverrides
+      const apiOverrides = {}
+      Object.entries(overridesPayload).forEach(([idx, vals]) => {
+        const entry = {}
+        if (vals.trafficFlow !== undefined) entry.traffic_flow = vals.trafficFlow
+        if (vals.avgSpeed    !== undefined) entry.avg_speed    = vals.avgSpeed
+        if (Object.keys(entry).length > 0) apiOverrides[String(idx)] = entry
+      })
+
+      // Map global params
+      const apiGlobal = {
+        rain: globalParams.rain,
+        temp: globalParams.temperature,
+        hour: globalParams.timeOfDay,
+        wind: globalParams.wind,
+      }
+
+      const resp = await fetch(apiUrl('/api/nodes/forecast'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          overrides: apiOverrides,
+          global_params: apiGlobal
+        }),
+      })
+      if (!resp.ok) return
+      const data = await resp.json()
+      const forecastNodes = data.nodes ?? []
+      setForecast(forecastNodes)
+      setLastTs(data.last_updated ?? '')
+      if (onForecastData) onForecastData(forecastNodes)
+    } catch (_) {
+      // network error
+    } finally {
+      setLoading(false)
+      if (!isBackground) setInferring(false)
+    }
+  }
+
+  // Initial load
+  useEffect(() => {
+    fetchWithOverrides({}, params)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Debounced re-inference whenever overrides OR global params change
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => {
+      fetchWithOverrides(nodeOverrides, params)
+    }, 350)
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeOverrides, params])
+
+  // Background auto-refresh
+  useEffect(() => {
+    autoRefreshRef.current = setInterval(() => {
+      fetchWithOverrides(nodeOverrides, params, true)
+    }, 30_000)
+    return () => clearInterval(autoRefreshRef.current)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeOverrides, params])
+
+  // Scroll selected node into view whenever it changes
+  useEffect(() => {
+    const key = `N${String(selectedNode + 1).padStart(3, '0')}`
+    const el = rowRefs.current[key]
+    if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [selectedNode])
+
+  const selectedNodeId = `N${String(selectedNode + 1).padStart(3, '0')}`
+  const hasOverrides = Object.keys(nodeOverrides).length > 0
+
+  return (
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100%',
+      overflow: 'hidden',
+    }}>
+      {/* Header */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '10px 16px 8px',
+        borderBottom: '1px solid rgba(100,200,255,0.12)',
+        flexShrink: 0,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: '50%',
+            background: '#34d399',
+            boxShadow: '0 0 10px #34d399',
+            display: 'inline-block',
+            animation: 'pulse 2s infinite',
+          }} />
+          <p style={{ fontSize: '0.72rem', fontWeight: 700, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#67e8f9', margin: 0 }}>
+            15-min Ahead Forecast — ST-QGCN Model{hasOverrides ? ' (with overrides)' : ''}
+          </p>
+        </div>
+        <p style={{ fontSize: '0.65rem', color: inferring ? '#fbbf24' : '#64748b', margin: 0 }}>
+          {loading ? 'Running model…' : inferring ? '⟳ Re-running inference…' : `Updated ${lastTs.slice(11, 16)} UTC`}
+        </p>
+      </div>
+
+      {/* Table */}
+      <div style={{ overflowY: 'auto', flex: 1, padding: '0 4px' }}>
+        <table style={{
+          width: '100%',
+          borderCollapse: 'collapse',
+          fontSize: '0.75rem',
+        }}>
+          <thead style={{ position: 'sticky', top: 0, zIndex: 2 }}>
+            <tr style={{ background: '#0b1829' }}>
+              {['Node', 'Zone', 'Pred. Flow (veh/hr)', 'Capacity', 'Util %', 'Congestion', 'Trend'].map((h) => (
+                <th key={h} style={{
+                  padding: '6px 10px',
+                  textAlign: 'left',
+                  fontSize: '0.63rem',
+                  fontWeight: 700,
+                  letterSpacing: '0.08em',
+                  textTransform: 'uppercase',
+                  color: '#475569',
+                  borderBottom: '1px solid rgba(100,200,255,0.1)',
+                  whiteSpace: 'nowrap',
+                }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {(forecast ?? []).slice(0, nodes.length).map((node, idx) => {
+              const isSelected = node.node_id === selectedNodeId
+              return (
+                <tr
+                  key={node.node_id}
+                  ref={(el) => { rowRefs.current[node.node_id] = el }}
+                  onClick={() => onNodeSelect(idx)}
+                  style={{
+                    cursor: 'pointer',
+                    background: isSelected
+                      ? 'rgba(34,211,238,0.10)'
+                      : idx % 2 === 0 ? 'rgba(255,255,255,0.01)' : 'transparent',
+                    boxShadow: isSelected ? 'inset 0 0 0 1.5px rgba(34,211,238,0.6)' : 'none',
+                    transition: 'background 0.2s, box-shadow 0.2s',
+                  }}
+                >
+                  <td style={{
+                    padding: '5px 10px',
+                    fontFamily: 'monospace',
+                    fontWeight: isSelected ? 800 : 500,
+                    color: isSelected ? '#e0f7ff' : '#cbd5e1',
+                    borderBottom: '1px solid rgba(255,255,255,0.03)',
+                  }}>
+                    {isSelected && <span style={{ color: '#22d3ee', marginRight: 4 }}>▶</span>}
+                    {node.node_id}
+                  </td>
+                  <td style={{ padding: '5px 10px', color: '#94a3b8', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                    {node.zone}
+                  </td>
+                  <td style={{
+                    padding: '5px 10px',
+                    fontWeight: isSelected ? 700 : 500,
+                    color: isSelected ? '#67e8f9' : '#e2e8f0',
+                    borderBottom: '1px solid rgba(255,255,255,0.03)',
+                  }}>
+                    {node.predicted_flow_veh_per_hr.toLocaleString()}
+                  </td>
+                  <td style={{ padding: '5px 10px', color: '#64748b', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                    {node.capacity_veh_per_hr.toLocaleString()}
+                  </td>
+                  <td style={{ padding: '5px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}>
+                      <div style={{
+                        flex: 1,
+                        height: 4,
+                        borderRadius: 9999,
+                        background: 'rgba(255,255,255,0.08)',
+                        overflow: 'hidden',
+                        minWidth: 40,
+                      }}>
+                        <div style={{
+                          height: '100%',
+                          width: `${node.utilisation_pct}%`,
+                          background: node.utilisation_pct > 74 ? '#ef4444'
+                            : node.utilisation_pct > 54 ? '#f97316'
+                              : node.utilisation_pct > 29 ? '#facc15'
+                                : '#22c55e',
+                          transition: 'width 0.6s ease',
+                        }} />
+                      </div>
+                      <span style={{ color: '#94a3b8', minWidth: 30 }}>{node.utilisation_pct}%</span>
+                    </div>
+                  </td>
+                  <td style={{ padding: '5px 10px', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                    <CongestionBadge level={node.congestion_level} />
+                  </td>
+                  <td style={{ padding: '5px 10px', textAlign: 'center', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                    <TrendArrow trend={node.trend} />
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+        {loading && (
+          <p style={{ textAlign: 'center', color: '#475569', fontSize: '0.75rem', padding: '16px 0' }}>
+            Running ST-QGCN inference…
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [params, setParams] = useState(DEFAULTS)
   const [runs, setRuns] = useState([])
@@ -462,69 +730,39 @@ function App() {
 
   const [selectedNode, setSelectedNode] = useState(0)
   const [nodeOverrides, setNodeOverrides] = useState({})
+  const [showMetrics, setShowMetrics] = useState(true)
 
   const network = useMemo(() => buildComplexNetwork(), [])
   const nodes = network.junctionNodes
   const edges = network.junctionEdges
   const roadSegments = network.roadSegments
 
+  // forecastData holds the last model response; drives both 3-D scene and table
+  const [forecastData, setForecastData] = useState([])
+
+  // nodeState is derived entirely from the model's forecast output
   const nodeState = useMemo(() => {
     const n = nodes.length
-    const baseFlow = 420
-    const baseSpeed = 42
-    const depthWeights = [1, 0.55, 0.25]
-
-    const neighbors = Array.from({ length: n }, () => [])
-    edges.forEach(({ a, b }) => {
-      neighbors[a].push(b)
-      neighbors[b].push(a)
+    if (forecastData.length === 0) {
+      // Before first model response: neutral state
+      return Array.from({ length: n }, () => ({ flow: 0, speed: 0, congestion: 0 }))
+    }
+    // Build a map from node_index → forecast row
+    const byIndex = {}
+    forecastData.forEach((row) => {
+      byIndex[row.node_index] = row
     })
-
-    const flowDelta = Array.from({ length: n }, () => 0)
-    const speedDelta = Array.from({ length: n }, () => 0)
-
-    Object.entries(nodeOverrides).forEach(([k, override]) => {
-      const source = Number(k)
-      if (!Number.isInteger(source) || source < 0 || source >= n) return
-
-      const sourceFlowDelta = (override.trafficFlow ?? baseFlow) - baseFlow
-      const sourceSpeedDelta = (override.avgSpeed ?? baseSpeed) - baseSpeed
-
-      const visitedDepth = Array.from({ length: n }, () => Infinity)
-      const queue = [[source, 0]]
-      visitedDepth[source] = 0
-
-      while (queue.length > 0) {
-        const [nodeIdx, depth] = queue.shift()
-        if (depth > 2) continue
-
-        const w = depthWeights[depth]
-        flowDelta[nodeIdx] += sourceFlowDelta * w
-        speedDelta[nodeIdx] += sourceSpeedDelta * w
-
-        if (depth === 2) continue
-        neighbors[nodeIdx].forEach((nb) => {
-          if (visitedDepth[nb] > depth + 1) {
-            visitedDepth[nb] = depth + 1
-            queue.push([nb, depth + 1])
-          }
-        })
-      }
-    })
-
     return Array.from({ length: n }, (_, idx) => {
-      const effectiveFlow = clamp(baseFlow + flowDelta[idx], 50, 1200)
-      const effectiveSpeed = clamp(baseSpeed + speedDelta[idx], 5, 100)
-      const flowNorm = clamp(effectiveFlow / 900, 0, 1.5)
-      const speedNorm = clamp(effectiveSpeed / 80, 0, 1.2)
-      const congestion = clamp(flowNorm * 0.55 + (1 - speedNorm) * 0.45, 0, 1.5)
-      return {
-        flow: effectiveFlow,
-        speed: effectiveSpeed,
-        congestion,
-      }
+      const row = byIndex[idx]
+      if (!row) return { flow: 0, speed: 0, congestion: 0 }
+      const flow     = row.predicted_flow_veh_per_hr
+      const capacity = row.capacity_veh_per_hr
+      const ratio    = capacity > 0 ? clamp(flow / capacity, 0, 1) : 0
+      // Derive a [0,1] congestion score directly from utilisation ratio
+      const congestion = ratio
+      return { flow, speed: 0, congestion }
     })
-  }, [edges, nodeOverrides, nodes.length])
+  }, [forecastData, nodes.length])
 
   const networkLoad = useMemo(() => {
     if (nodeState.length === 0) return 0
@@ -606,17 +844,18 @@ function App() {
     return () => clearInterval(timer)
   }, [activeRun])
 
+  // Default slider values for a node come from the latest model forecast
+  const selectedForecastRow = forecastData.find((r) => r.node_index === selectedNode)
   const selectedState = nodeOverrides[selectedNode] ?? {
-    trafficFlow: selectedNode !== null && selectedNode !== undefined && nodeState ? Math.round(nodeState[selectedNode]?.flow ?? 420) : 420,
-    avgSpeed: selectedNode !== null && selectedNode !== undefined && nodeState ? Math.round(nodeState[selectedNode]?.speed ?? 42) : 42,
+    trafficFlow: selectedForecastRow ? Math.round(selectedForecastRow.predicted_flow_veh_per_hr) : 0,
+    avgSpeed: 0,
   }
   const selectedNodeName = selectedNode !== null && selectedNode !== undefined
     ? `JUNC-${String(selectedNode + 1).padStart(3, '0')}`
     : 'None'
 
-  const liveHeatPressure = Math.round(
-    clamp(((selectedState.trafficFlow / 1200) * 100 + (1 - selectedState.avgSpeed / 100) * 100) / 2, 0, 100),
-  )
+  const selectedUtil = selectedForecastRow ? selectedForecastRow.utilisation_pct : 0
+  const liveHeatPressure = Math.round(clamp(selectedUtil, 0, 100))
   const liveWeatherSeverity = Math.round((params.rain + params.wind) / 2)
   const bestVal = Number(metrics?.best_val_mse)
   const testMse = Number(metrics?.test_mse)
@@ -689,7 +928,7 @@ function App() {
             <p className="mt-1 text-xs text-slate-300">Tap a node in the scene to edit local parameters.</p>
             <div className="mt-4 space-y-4">
               <Slider
-                label="Predicted Traffic Density"
+                label="Traffic Density"
                 value={selectedState.trafficFlow}
                 min={50}
                 max={1200}
@@ -698,7 +937,7 @@ function App() {
                 onChange={(v) => setSelectedNodeParam('trafficFlow', v)}
               />
               <Slider
-                label="Predicted Avg Speed"
+                label="Avg Speed"
                 value={selectedState.avgSpeed}
                 min={5}
                 max={100}
@@ -726,30 +965,77 @@ function App() {
           animate={{ y: 0, opacity: 1 }}
           transition={{ duration: 0.7, delay: 0.15 }}
           className="glass-panel relative h-full overflow-hidden rounded-3xl border border-slate-200/15"
+          style={{ display: 'flex', flexDirection: 'column' }}
         >
-          <div className="absolute left-4 top-4 z-10 rounded-xl border border-amber-300/20 bg-slate-900/70 px-4 py-3 text-xs text-slate-200 backdrop-blur">
-            <p className="font-semibold tracking-wide text-amber-200">Live Metrics</p>
-            <p className="mt-1">Heat Pressure: {liveHeatPressure}%</p>
-            <p>Weather Severity: {liveWeatherSeverity}%</p>
-            <p>Daylight: {Math.round(dayFactor * 100)}%</p>
-            <p className="mt-2 text-cyan-200">Backend Best Val MSE: {Number.isFinite(bestVal) ? bestVal.toFixed(4) : 'n/a'}</p>
-            <p>Backend Test MSE: {Number.isFinite(testMse) ? testMse.toFixed(4) : 'n/a'}</p>
-            <p>Backend Test MAE: {Number.isFinite(testMae) ? testMae.toFixed(4) : 'n/a'}</p>
-            <p>Best Epoch: {Number.isFinite(bestEpoch) ? bestEpoch : 'n/a'}</p>
+          {/* 3-D canvas — takes ~58% of height */}
+          <div style={{ position: 'relative', flex: '0 0 58%', overflow: 'hidden' }}>
+            <div className={`absolute left-4 top-4 z-10 rounded-xl border border-amber-300/20 bg-slate-900/70 text-xs text-slate-200 backdrop-blur transition-all duration-300 ${showMetrics ? 'px-4 py-3 w-64' : 'px-3 py-2 w-auto'}`}>
+              <div className="flex items-center justify-between gap-4">
+                <p className="font-semibold tracking-wide text-amber-200">Live Metrics</p>
+                <button 
+                  onClick={() => setShowMetrics(!showMetrics)}
+                  className="rounded-md bg-white/10 px-1.5 py-0.5 text-[10px] hover:bg-white/20"
+                >
+                  {showMetrics ? 'Hide' : 'Show'}
+                </button>
+              </div>
+              
+              {showMetrics && (
+                <motion.div 
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  className="overflow-hidden"
+                >
+                  <p className="mt-2">Heat Pressure: {liveHeatPressure}%</p>
+                  <p>Weather Severity: {liveWeatherSeverity}%</p>
+                  <p>Daylight: {Math.round(dayFactor * 100)}%</p>
+                  <div className="mt-3 space-y-1 border-t border-white/5 pt-2">
+                    <p className="text-cyan-200">Backend Best Val MSE: {Number.isFinite(bestVal) ? bestVal.toFixed(4) : 'n/a'}</p>
+                    <p>Backend Test MSE: {Number.isFinite(testMse) ? testMse.toFixed(4) : 'n/a'}</p>
+                    <p>Backend Test MAE: {Number.isFinite(testMae) ? testMae.toFixed(4) : 'n/a'}</p>
+                    <p>Best Epoch: {Number.isFinite(bestEpoch) ? bestEpoch : 'n/a'}</p>
+                  </div>
+                </motion.div>
+              )}
+            </div>
+
+            <div className="h-full min-h-[320px] w-full">
+              <Canvas shadows gl={{ antialias: true }} dpr={[1, 1.8]}>
+                <PerspectiveCamera makeDefault position={[14, 14, 20]} fov={52} />
+                <NetworkScene
+                  params={params}
+                  selectedNode={selectedNode}
+                  onNodeSelect={setSelectedNode}
+                  network={network}
+                  nodeState={nodeState}
+                  networkLoad={networkLoad}
+                />
+              </Canvas>
+            </div>
           </div>
 
-          <div className="h-full min-h-[500px] w-full">
-            <Canvas shadows gl={{ antialias: true }} dpr={[1, 1.8]}>
-              <PerspectiveCamera makeDefault position={[14, 14, 20]} fov={52} />
-              <NetworkScene
-                params={params}
-                selectedNode={selectedNode}
-                onNodeSelect={setSelectedNode}
-                network={network}
-                nodeState={nodeState}
-                networkLoad={networkLoad}
-              />
-            </Canvas>
+          {/* Divider */}
+          <div style={{
+            height: 1,
+            background: 'linear-gradient(90deg, transparent, rgba(103,232,249,0.25), transparent)',
+            flexShrink: 0,
+          }} />
+
+          {/* Node Forecast Table — takes remaining ~42% */}
+          <div style={{
+            flex: '1 1 0',
+            overflow: 'hidden',
+            background: 'rgba(4, 16, 34, 0.75)',
+            backdropFilter: 'blur(12px)',
+          }}>
+            <NodeForecastTable
+              selectedNode={selectedNode}
+              onNodeSelect={setSelectedNode}
+              nodeOverrides={nodeOverrides}
+              onForecastData={setForecastData}
+              params={params}
+              nodes={nodes}
+            />
           </div>
         </motion.section>
       </main>
