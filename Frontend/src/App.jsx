@@ -286,76 +286,12 @@ function RainField({ rain, wind }) {
   )
 }
 
-function NetworkScene({ params, selectedNode, nodeOverrides, onNodeSelect }) {
-  const network = useMemo(() => buildComplexNetwork(), [])
+function NetworkScene({ params, selectedNode, onNodeSelect, network, nodeState, networkLoad }) {
   const nodes = network.junctionNodes
-  const edges = network.junctionEdges
   const roadSegments = network.roadSegments
 
   const pulseRef = useRef([])
   const day = toDaylightFactor(params.timeOfDay)
-  const nodeState = useMemo(() => {
-    const n = nodes.length
-    const baseFlow = 420
-    const baseSpeed = 42
-    const depthWeights = [1, 0.55, 0.25]
-
-    const neighbors = Array.from({ length: n }, () => [])
-    edges.forEach(({ a, b }) => {
-      neighbors[a].push(b)
-      neighbors[b].push(a)
-    })
-
-    const flowDelta = Array.from({ length: n }, () => 0)
-    const speedDelta = Array.from({ length: n }, () => 0)
-
-    Object.entries(nodeOverrides).forEach(([k, override]) => {
-      const source = Number(k)
-      if (!Number.isInteger(source) || source < 0 || source >= n) return
-
-      const sourceFlowDelta = (override.trafficFlow ?? baseFlow) - baseFlow
-      const sourceSpeedDelta = (override.avgSpeed ?? baseSpeed) - baseSpeed
-
-      const visitedDepth = Array.from({ length: n }, () => Infinity)
-      const queue = [[source, 0]]
-      visitedDepth[source] = 0
-
-      while (queue.length > 0) {
-        const [nodeIdx, depth] = queue.shift()
-        if (depth > 2) continue
-
-        const w = depthWeights[depth]
-        flowDelta[nodeIdx] += sourceFlowDelta * w
-        speedDelta[nodeIdx] += sourceSpeedDelta * w
-
-        if (depth === 2) continue
-        neighbors[nodeIdx].forEach((nb) => {
-          if (visitedDepth[nb] > depth + 1) {
-            visitedDepth[nb] = depth + 1
-            queue.push([nb, depth + 1])
-          }
-        })
-      }
-    })
-
-    return Array.from({ length: n }, (_, idx) => {
-      const effectiveFlow = clamp(baseFlow + flowDelta[idx], 50, 1200)
-      const effectiveSpeed = clamp(baseSpeed + speedDelta[idx], 5, 100)
-      const flowNorm = clamp(effectiveFlow / 900, 0, 1.5)
-      const speedNorm = clamp(effectiveSpeed / 80, 0, 1.2)
-      const congestion = clamp(flowNorm * 0.55 + (1 - speedNorm) * 0.45, 0, 1.5)
-      return {
-        flow: effectiveFlow,
-        speed: effectiveSpeed,
-        congestion,
-      }
-    })
-  }, [edges, nodeOverrides, nodes.length])
-
-  const networkLoad = useMemo(() => {
-    if (nodeState.length === 0) return 0
-    return nodeState.reduce((sum, n) => sum + n.congestion, 0) / nodeState.length
-  }, [nodeState])
 
   const bgColor = lerpHexColor('#041022', '#88d2ff', day)
   const fogColor = lerpHexColor('#07121f', '#9ac3de', day)
@@ -527,6 +463,74 @@ function App() {
   const [selectedNode, setSelectedNode] = useState(0)
   const [nodeOverrides, setNodeOverrides] = useState({})
 
+  const network = useMemo(() => buildComplexNetwork(), [])
+  const nodes = network.junctionNodes
+  const edges = network.junctionEdges
+  const roadSegments = network.roadSegments
+
+  const nodeState = useMemo(() => {
+    const n = nodes.length
+    const baseFlow = 420
+    const baseSpeed = 42
+    const depthWeights = [1, 0.55, 0.25]
+
+    const neighbors = Array.from({ length: n }, () => [])
+    edges.forEach(({ a, b }) => {
+      neighbors[a].push(b)
+      neighbors[b].push(a)
+    })
+
+    const flowDelta = Array.from({ length: n }, () => 0)
+    const speedDelta = Array.from({ length: n }, () => 0)
+
+    Object.entries(nodeOverrides).forEach(([k, override]) => {
+      const source = Number(k)
+      if (!Number.isInteger(source) || source < 0 || source >= n) return
+
+      const sourceFlowDelta = (override.trafficFlow ?? baseFlow) - baseFlow
+      const sourceSpeedDelta = (override.avgSpeed ?? baseSpeed) - baseSpeed
+
+      const visitedDepth = Array.from({ length: n }, () => Infinity)
+      const queue = [[source, 0]]
+      visitedDepth[source] = 0
+
+      while (queue.length > 0) {
+        const [nodeIdx, depth] = queue.shift()
+        if (depth > 2) continue
+
+        const w = depthWeights[depth]
+        flowDelta[nodeIdx] += sourceFlowDelta * w
+        speedDelta[nodeIdx] += sourceSpeedDelta * w
+
+        if (depth === 2) continue
+        neighbors[nodeIdx].forEach((nb) => {
+          if (visitedDepth[nb] > depth + 1) {
+            visitedDepth[nb] = depth + 1
+            queue.push([nb, depth + 1])
+          }
+        })
+      }
+    })
+
+    return Array.from({ length: n }, (_, idx) => {
+      const effectiveFlow = clamp(baseFlow + flowDelta[idx], 50, 1200)
+      const effectiveSpeed = clamp(baseSpeed + speedDelta[idx], 5, 100)
+      const flowNorm = clamp(effectiveFlow / 900, 0, 1.5)
+      const speedNorm = clamp(effectiveSpeed / 80, 0, 1.2)
+      const congestion = clamp(flowNorm * 0.55 + (1 - speedNorm) * 0.45, 0, 1.5)
+      return {
+        flow: effectiveFlow,
+        speed: effectiveSpeed,
+        congestion,
+      }
+    })
+  }, [edges, nodeOverrides, nodes.length])
+
+  const networkLoad = useMemo(() => {
+    if (nodeState.length === 0) return 0
+    return nodeState.reduce((sum, n) => sum + n.congestion, 0) / nodeState.length
+  }, [nodeState])
+
   const setParam = (key) => (val) => {
     setParams((prev) => ({ ...prev, [key]: val }))
   }
@@ -602,7 +606,10 @@ function App() {
     return () => clearInterval(timer)
   }, [activeRun])
 
-  const selectedState = nodeOverrides[selectedNode] ?? { trafficFlow: 420, avgSpeed: 42 }
+  const selectedState = nodeOverrides[selectedNode] ?? {
+    trafficFlow: selectedNode !== null && selectedNode !== undefined && nodeState ? Math.round(nodeState[selectedNode]?.flow ?? 420) : 420,
+    avgSpeed: selectedNode !== null && selectedNode !== undefined && nodeState ? Math.round(nodeState[selectedNode]?.speed ?? 42) : 42,
+  }
   const selectedNodeName = selectedNode !== null && selectedNode !== undefined
     ? `JUNC-${String(selectedNode + 1).padStart(3, '0')}`
     : 'None'
@@ -682,7 +689,7 @@ function App() {
             <p className="mt-1 text-xs text-slate-300">Tap a node in the scene to edit local parameters.</p>
             <div className="mt-4 space-y-4">
               <Slider
-                label="Traffic Flow"
+                label="Predicted Traffic Density"
                 value={selectedState.trafficFlow}
                 min={50}
                 max={1200}
@@ -691,7 +698,7 @@ function App() {
                 onChange={(v) => setSelectedNodeParam('trafficFlow', v)}
               />
               <Slider
-                label="Avg Speed"
+                label="Predicted Avg Speed"
                 value={selectedState.avgSpeed}
                 min={5}
                 max={100}
@@ -737,8 +744,10 @@ function App() {
               <NetworkScene
                 params={params}
                 selectedNode={selectedNode}
-                nodeOverrides={nodeOverrides}
                 onNodeSelect={setSelectedNode}
+                network={network}
+                nodeState={nodeState}
+                networkLoad={networkLoad}
               />
             </Canvas>
           </div>

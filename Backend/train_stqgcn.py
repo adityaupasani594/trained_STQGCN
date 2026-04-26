@@ -414,6 +414,8 @@ class QuantumGraphConv(nn.Module):
         self.n_qubits        = n_qubits
         self.target_node_idx = target_node_idx
         self.msg_dropout     = nn.Dropout(dropout)
+        self.W_gcn           = nn.Linear(hidden_dim, hidden_dim) # Graph Convolutional Update weight
+        self.act             = nn.GELU()                         # Graph Convolutional Update activation
         self.pre             = nn.Linear(hidden_dim, n_qubits)
         self.post            = nn.Linear(n_qubits, hidden_dim)
 
@@ -438,6 +440,7 @@ class QuantumGraphConv(nn.Module):
     ) -> torch.Tensor:
         # ── Step 1: classical graph aggregation (all N nodes) ────────────────
         x_agg = torch.einsum("ij,bjh->bih", norm_adj, x)   # [B, N, H]
+        x_agg = self.act(self.W_gcn(x_agg))               # Graph Convolutional Update (Eq 4)
         x_agg = self.msg_dropout(x_agg)
 
         # ── Step 2: quantum refinement — TARGET NODE ONLY ────────────────────
