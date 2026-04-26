@@ -557,7 +557,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train ST-QGCN (optimised)")
 
     # Data
-    p.add_argument("--data",        default="combined_stqgcn_dataset.csv")
+    p.add_argument("--data",        default="combined_stqgcn_dataset_5s.csv")
     p.add_argument("--sheet-name",  default="Node_Features")
     p.add_argument("--time-col",    default="Timestamp")
     p.add_argument("--node-col",    default="Node_ID")

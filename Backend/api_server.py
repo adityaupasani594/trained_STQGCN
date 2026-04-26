@@ -266,7 +266,7 @@ def _load_engine() -> None:
     _engine.norm_adj = torch.from_numpy(adj)
 
     # ── Load dataset for baseline window + node metadata ─────────────────────
-    data_file = cfg.get("data", "combined_stqgcn_dataset.csv")
+    data_file = cfg.get("data", "combined_stqgcn_dataset_5s.csv")
     data_path = BACKEND_DIR / data_file
     if not data_path.exists():
         _engine.error = f"Dataset file not found: {data_path}"
