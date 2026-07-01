@@ -490,6 +490,490 @@ class STQGCN(nn.Module):
         return self.readout(target)                         # [B, 1]
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Hierarchical ST-QGCN — 3-Layer Quantum Graph Network
+# ─────────────────────────────────────────────────────────────────────────────
+
+class QuantumSTLayer(nn.Module):
+    """
+    Single hierarchical level: Steps 2-14 of Math Model v2.
+
+    Each node is assigned its own 1-qubit quantum circuit:
+      Step  2: Contextualized node embedding  (ReLU linear projection)
+      Steps 3-6: Message passing, GCN update, neighbourhood aggregation, residual
+      Steps 7-9: Quantum Interface Compression — pre-projection + RY angle embedding
+      Steps 10-12: Variational evolution (BasicEntanglerLayers) + Z-measurement
+      Steps 13-14: Post-projection + LayerNorm => robust layer state H_l
+
+    Input / output: H [B, N, hidden_dim],  A [B|N, N] dense adjacency
+    """
+
+    def __init__(self, hidden_dim: int, n_q_layers: int, dropout: float):
+        super().__init__()
+        N_QUBITS = 1   # one qubit per node as specified
+        self.n_qubits    = N_QUBITS
+        self.dropout_fn  = nn.Dropout(dropout)
+
+        # Step 2: Contextualized node embedding
+        self.embed = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
+
+        # Steps 3-6: Message-passing / GCN
+        self.W_gcn = nn.Linear(hidden_dim, hidden_dim)
+        self.act   = nn.GELU()
+
+        # Steps 7-9: Quantum compression  hidden_dim -> 1 qubit angle
+        self.pre = nn.Linear(hidden_dim, N_QUBITS)
+
+        # Steps 10-12: 1-qubit variational circuit (RY embedding + RX/RZ rotations)
+        # Using lightning.qubit and adjoint diff like the original STQGCN to support batching
+        dev = qml.device("lightning.qubit", wires=N_QUBITS)
+
+        @qml.qnode(dev, interface="torch", diff_method="adjoint")
+        def _circuit(inputs, weights):
+            # RY angle embedding (Step 9)
+            qml.AngleEmbedding(inputs, wires=range(N_QUBITS), rotation="Y")
+            # Variational evolution (Steps 10-11);
+            # on 1 qubit BasicEntanglerLayers = single-qubit RX rotations
+            qml.BasicEntanglerLayers(weights, wires=range(N_QUBITS))
+            # Step 12: Measure PauliZ expectation value
+            return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
+
+        self.qlayer = qml.qnn.TorchLayer(_circuit, {"weights": (n_q_layers, N_QUBITS)})
+
+        # Steps 13-14: Post-projection + LayerNorm
+        self.post = nn.Linear(N_QUBITS, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        H: torch.Tensor,            # [B, N, hidden_dim]
+        A: torch.Tensor,            # [N, N] or [B, N, N] dense adjacency
+        return_qubit_angles: bool = False,
+    ):
+        B, N, Hd = H.shape
+
+        # Step 2: contextualized embedding
+        H = self.embed(H)                                        # [B, N, H]
+
+        # Steps 3-6: GCN aggregation + residual
+        if A.dim() == 2:
+            H_agg = torch.einsum("ij,bjh->bih", A, H)           # [B, N, H]
+        else:  # [B, N, N]
+            H_agg = torch.bmm(A, H)
+        H_gcn = self.act(self.W_gcn(H_agg))
+        H_gcn = self.dropout_fn(H_gcn)
+        H_res = H + H_gcn                                        # residual
+
+        # Steps 7-9: compress each node embedding to 1 qubit angle in [-pi, pi]
+        H_flat  = H_res.reshape(B * N, Hd).float()              # [B*N, H]
+        angles  = torch.tanh(self.pre(H_flat)) * math.pi        # [B*N, 1]
+
+        # Steps 10-12: 1-qubit quantum circuit — B*N independent circuits
+        q_out = self.qlayer(angles.cpu())                        # [B*N, 1]  on CPU
+        q_out = q_out.to(device=H_res.device, dtype=H_res.dtype)
+
+        # Steps 13-14: post-projection + quantum-enhanced LayerNorm update
+        H_q   = self.post(q_out).reshape(B, N, Hd)              # [B, N, H]
+        H_out = self.norm(H_res + H_q)                          # layer state H_l
+
+        if return_qubit_angles:
+            return H_out, angles.detach().cpu()                  # angles: [B*N, 1]
+        return H_out
+
+
+class GraphPoolingBridge(nn.Module):
+    """
+    Differentiable soft-assignment graph pooling bridge.
+
+    Learns assignment S in R^{N x N_next} via:
+        S = softmax( H @ W_assign )       [B, N, N_next]
+        H_next = S^T @ H                  [B, N_next, hidden_dim]
+        A_next = S^T @ A @ S              [B, N_next, N_next]
+    """
+
+    def __init__(self, hidden_dim: int, n_curr: int, n_next: int):
+        super().__init__()
+        self.n_next    = n_next
+        self.W_assign  = nn.Linear(hidden_dim, n_next, bias=False)
+        self.norm      = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        H: torch.Tensor,   # [B, N, H]
+        A: torch.Tensor,   # [N, N] or [B, N, N]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, N, Hd = H.shape
+
+        # Soft assignment matrix S [B, N, N_next]
+        S = torch.softmax(self.W_assign(H), dim=-1)
+
+        # H_next = S^T H   ->   [B, N_next, H]
+        H_next = torch.bmm(S.transpose(1, 2), H)
+        H_next = self.norm(H_next)
+
+        # A_next = S^T A S   ->   [B, N_next, N_next]
+        if A.dim() == 2:
+            A_b = A.unsqueeze(0).expand(B, -1, -1)   # [B, N, N]
+        else:
+            A_b = A
+        A_next = torch.bmm(S.transpose(1, 2), torch.bmm(A_b, S))
+
+        return H_next, A_next
+
+
+class HierarchicalSTQGN(nn.Module):
+    """
+    3-Layer Hierarchical Spatio-Temporal Quantum Graph Network.
+
+    Hierarchy (default pool_ratio=3, N=18):
+      Layer 0 — Micro       : N0 = N   nodes  (road junctions, Star/Tree/Mesh)
+      Layer 1 — Regional    : N1 = N//pool_ratio   nodes  (regional highways)
+      Layer 2 — National    : N2 = N1//pool_ratio  nodes  (national highways)
+
+    Each node at every layer owns exactly 1 qubit.
+    Bloch sphere coordinates for Layer 1 nodes are logged during training.
+
+    Final output (Step 15): Edge Prediction MLP  ->  y_hat [B, 1]
+    """
+
+    def __init__(
+        self,
+        n_nodes:         int,
+        n_features:      int,
+        hidden_dim:      int,
+        n_q_layers:      int,
+        dropout:         float,
+        pool_ratio:      int = 3,
+        target_node_idx: int = 0,
+    ):
+        super().__init__()
+        self.target_node_idx = target_node_idx
+        self.pool_ratio      = pool_ratio
+
+        # Node counts at each hierarchy level
+        n0 = n_nodes
+        n1 = max(2, n_nodes    // pool_ratio)
+        n2 = max(1, n1         // pool_ratio)
+        self.layer_sizes = [n0, n1, n2]
+        print(
+            f"[HierarchicalSTQGN] Node counts per layer: "
+            f"L0={n0} -> L1={n1} -> L2={n2}  "
+            f"| Qubits per node: 1 | Total qubits: {n0+n1+n2}"
+        )
+
+        # Shared temporal encoder (processes raw [B,T,N,F] input -> [B,N,H])
+        self.temporal = TemporalEncoder(n_features, hidden_dim, dropout)
+
+        # One QuantumSTLayer per hierarchy level
+        self.qst_layers = nn.ModuleList([
+            QuantumSTLayer(hidden_dim, n_q_layers, dropout)
+            for _ in range(3)
+        ])
+
+        # Two pooling bridges: L0->L1,  L1->L2
+        self.pool_bridges = nn.ModuleList([
+            GraphPoolingBridge(hidden_dim, n0, n1),
+            GraphPoolingBridge(hidden_dim, n1, n2),
+        ])
+
+        # Step 15: Edge Prediction MLP (readout on all N2 top-level nodes)
+        readout_in = n2 * hidden_dim
+        self.readout = nn.Sequential(
+            nn.Linear(readout_in, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        x:               torch.Tensor,   # [B, T, N, F]
+        norm_adj:        torch.Tensor,   # [N, N]  Layer-0 adjacency
+        return_bloch_data: bool = False,
+    ):
+        B = x.shape[0]
+
+        # Temporal encoding -> H_0  [B, N, H]
+        H = self.temporal(x)
+        A = norm_adj     # starts as [N, N]; pooled to [B, N_l, N_l] after each bridge
+
+        bloch_angles: Dict[int, torch.Tensor] = {}  # layer_idx -> angles [B, N_l, 1]
+
+        for l in range(3):
+            if return_bloch_data:
+                H, angles = self.qst_layers[l](H, A, return_qubit_angles=True)
+                N_l = self.layer_sizes[l]
+                bloch_angles[l] = angles.reshape(B, N_l, 1)
+            else:
+                H = self.qst_layers[l](H, A)
+
+            if l < 2:   # pool after Layer 0 and Layer 1
+                H, A = self.pool_bridges[l](H, A)
+
+        # Step 15: flatten all N2 node embeddings and predict
+        B2, N2, Hd = H.shape
+        H_flat = H.reshape(B2, N2 * Hd)    # [B, N2*H]
+        out    = self.readout(H_flat)       # [B, 1]
+
+        if return_bloch_data:
+            return out, bloch_angles
+        return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bloch Sphere Logging + Qiskit Video Generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BlochSphereLogger:
+    """
+    Records per-qubit Bloch sphere coordinates at each logging epoch.
+
+    For a single-qubit state prepared by RY(theta):
+        |psi> = cos(theta/2)|0> + sin(theta/2)|1>
+    The Bloch vector is:
+        x = <X> = sin(theta)
+        y = <Y> = 0            (pure real state after RY alone)
+        z = <Z> = cos(theta)
+
+    After BasicEntanglerLayers (RX rotations on 1 qubit), x/y/z are
+    approximate; exact only for pure RY embedding. We log theta (the
+    pre-projection angle) and derive coordinates analytically for
+    zero-overhead logging during training.
+
+    log_layer: which hierarchy level to log (default 1 = Regional, N1=6 nodes)
+    """
+
+    def __init__(self, log_layer: int = 1):
+        self.log_layer = log_layer
+        # qubit_idx -> [(epoch, x, y, z), ...]
+        self.log: Dict[int, List[Tuple]] = {}
+
+    def record(self, epoch: int, bloch_angles_by_layer: Dict[int, torch.Tensor]) -> None:
+        """
+        bloch_angles_by_layer: {layer_idx: tensor [B, N_l, 1]}
+        Averages over the batch and records Bloch coords for each node.
+        """
+        if self.log_layer not in bloch_angles_by_layer:
+            return
+        angles = bloch_angles_by_layer[self.log_layer]  # [B, N_l, 1]
+        # mean over batch dimension
+        mean_angles = angles.mean(dim=0).squeeze(-1)     # [N_l]
+
+        for qubit_idx, theta in enumerate(mean_angles.tolist()):
+            if qubit_idx not in self.log:
+                self.log[qubit_idx] = []
+            x = float(math.sin(theta))
+            y = 0.0
+            z = float(math.cos(theta))
+            self.log[qubit_idx].append((epoch, x, y, z))
+
+    def save(self, path: Path) -> None:
+        serializable = {
+            str(k): [list(e) for e in v]
+            for k, v in self.log.items()
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2)
+        print(f"  Bloch sphere log saved -> {path}")
+
+    @classmethod
+    def load(cls, path: Path, log_layer: int = 1) -> "BlochSphereLogger":
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        obj = cls(log_layer=log_layer)
+        obj.log = {int(k): [tuple(e) for e in v] for k, v in raw.items()}
+        return obj
+
+
+def generate_bloch_sphere_images(
+    logger:    "BlochSphereLogger",
+    plots_dir: Path,
+    fps:       int = 6,
+) -> None:
+    """
+    After training, generate:
+      1. One PNG per qubit  (bloch_spheres/bloch_qubit_N.png)
+         Rendered with qiskit.visualization.plot_bloch_vector showing the
+         final trained state of each qubit's Bloch sphere.
+      2. One animated MP4   (bloch_sphere_evolution.mp4)
+         All qubits evolving over training epochs in one grid video,
+         with the trajectory dots drawn frame-by-frame.
+
+    Requires: qiskit  (pip install qiskit)
+              matplotlib, ffmpeg (for mp4 writer)
+    """
+    try:
+        from qiskit.visualization import plot_bloch_vector  # type: ignore
+    except ImportError:
+        print(
+            "Warning: qiskit not found — Bloch sphere images skipped.\n"
+            "  Install with:  pip install qiskit"
+        )
+        return
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        print("Warning: matplotlib unavailable — Bloch sphere images skipped.")
+        return
+
+    n_qubits = len(logger.log)
+    if n_qubits == 0:
+        print("Warning: No Bloch sphere data was logged — skipping image generation.")
+        return
+
+    bloch_dir = plots_dir / "bloch_spheres"
+    bloch_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nGenerating Bloch sphere images for {n_qubits} qubits...")
+
+    # ── 1. Static per-qubit PNG via Qiskit ───────────────────────────────────
+    for qubit_idx in sorted(logger.log.keys()):
+        entries = logger.log[qubit_idx]
+        if not entries:
+            continue
+
+        # Final-epoch Bloch vector
+        _, xf, yf, zf = entries[-1]
+
+        try:
+            fig = plot_bloch_vector(
+                [xf, yf, zf],
+                title=f"Node {qubit_idx} · Qubit {qubit_idx}\nFinal Trained State",
+                figsize=(5, 5),
+            )
+            # Draw trajectory as dots on the sphere axes
+            # plot_bloch_vector returns a matplotlib Figure with a single Axes3D
+            ax3d = fig.axes[0]
+            xs = [e[1] for e in entries]
+            ys = [e[2] for e in entries]
+            zs = [e[3] for e in entries]
+            ax3d.plot(
+                xs, ys, zs,
+                "o-",
+                color="#ff6b35",
+                markersize=3,
+                linewidth=1.2,
+                alpha=0.7,
+                label="Training trajectory",
+                zorder=10,
+            )
+            ax3d.scatter([xf], [yf], [zf], color="#ff0055", s=80, zorder=11)
+            ax3d.legend(loc="upper right", fontsize=7)
+
+            out_png = bloch_dir / f"bloch_qubit_{qubit_idx}.png"
+            fig.savefig(out_png, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  Saved {out_png.name}")
+        except Exception as exc:
+            print(f"  Warning: could not generate Bloch PNG for qubit {qubit_idx}: {exc}")
+
+    # ── 2. Animated MP4s: Individual video per qubit ────────────────────────
+    try:
+        all_epochs = sorted({
+            e[0] for entries in logger.log.values() for e in entries
+        })
+        n_frames = len(all_epochs)
+
+        def _draw_sphere(ax):
+            """Draw static wireframe sphere on ax."""
+            u = np.linspace(0, 2 * np.pi, 30)
+            v = np.linspace(0, np.pi, 20)
+            sx = np.outer(np.cos(u), np.sin(v))
+            sy = np.outer(np.sin(u), np.sin(v))
+            sz = np.outer(np.ones_like(u), np.cos(v))
+            ax.plot_wireframe(sx, sy, sz, color="#1a3a5c", linewidth=0.3, alpha=0.4)
+            for xs2, ys2, zs2 in [
+                ([0, 0], [0, 0], [-1.2, 1.2]),
+                ([-1.2, 1.2], [0, 0], [0, 0]),
+                ([0, 0], [-1.2, 1.2], [0, 0]),
+            ]:
+                ax.plot(xs2, ys2, zs2, color="#2a4a6c", linewidth=0.6)
+            ax.set_xlim(-1.3, 1.3)
+            ax.set_ylim(-1.3, 1.3)
+            ax.set_zlim(-1.3, 1.3)
+            ax.set_facecolor("#0a0a14")
+            ax.tick_params(colors="#555")
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#333")
+
+        sorted_qubits = sorted(logger.log.keys())
+
+        for qubit_idx in sorted_qubits:
+            fig_vid = plt.figure(figsize=(4, 4))
+            ax = fig_vid.add_subplot(111, projection="3d")
+            fig_vid.patch.set_facecolor("#0a0a14")
+            
+            _draw_sphere(ax)
+            ax.set_title(
+                f"Node {qubit_idx} · Qubit {qubit_idx} Evolution",
+                color="#90c8ff", fontsize=10, pad=2,
+            )
+
+            scatter_handle = None
+            trail_handle = None
+
+            def _update(frame_idx):
+                nonlocal scatter_handle, trail_handle
+                epoch = all_epochs[frame_idx]
+                
+                entries_up_to = [
+                    e for e in logger.log[qubit_idx] if e[0] <= epoch
+                ]
+                if not entries_up_to:
+                    return []
+
+                # Remove old scatter / trail
+                if scatter_handle is not None:
+                    scatter_handle.remove()
+                if trail_handle is not None:
+                    trail_handle[0].remove()
+
+                xs2 = [e[1] for e in entries_up_to]
+                ys2 = [e[2] for e in entries_up_to]
+                zs2 = [e[3] for e in entries_up_to]
+
+                trail_handle = ax.plot(
+                    xs2, ys2, zs2,
+                    "-", color="#ff6b35", linewidth=1.0, alpha=0.55, zorder=4,
+                )
+                scatter_handle = ax.scatter(
+                    [xs2[-1]], [ys2[-1]], [zs2[-1]],
+                    color="#ff0055", s=60, zorder=5,
+                )
+
+                fig_vid.suptitle(
+                    f"Epoch {epoch}",
+                    color="white", fontsize=9, fontweight="bold", y=0.05
+                )
+                return [scatter_handle, trail_handle[0]]
+
+            ani = animation.FuncAnimation(
+                fig_vid, _update,
+                frames=n_frames,
+                interval=max(40, 1000 // fps),
+                blit=False,
+            )
+
+            video_path = plots_dir / f"bloch_sphere_qubit_{qubit_idx}.mp4"
+            writer = animation.FFMpegWriter(
+                fps=fps, metadata={"title": f"Bloch Sphere Qubit {qubit_idx}"},
+                extra_args=["-vcodec", "libx264", "-pix_fmt", "yuv420p"],
+            )
+            ani.save(str(video_path), writer=writer, dpi=120)
+            plt.close(fig_vid)
+            print(f"  Saved animated video -> {video_path.name}")
+
+    except Exception as exc:
+        print(
+            f"  Warning: Bloch sphere video generation failed ({exc}).\n"
+            "  Install ffmpeg and ensure it is on PATH for MP4 export."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Training helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def to_loaders(
@@ -784,6 +1268,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-q-layers",  type=int,   default=2)
     p.add_argument("--dropout",     type=float, default=0.10)
 
+    # Hierarchical model
+    p.add_argument("--hierarchical",        action="store_true",
+                   help="Use 3-layer HierarchicalSTQGN instead of flat STQGCN.")
+    p.add_argument("--pool-ratio",          type=int, default=3,
+                   help="Pooling ratio between hierarchy levels (N -> N//ratio).")
+    p.add_argument("--bloch-log-interval",  type=int, default=5,
+                   help="Log Bloch sphere qubit coordinates every N epochs (hierarchical mode).")
+    p.add_argument("--bloch-log-layer",     type=int, default=1,
+                   help="Which hierarchy layer to log Bloch coords for (0,1,2). Default: 1 (Regional).")
+
     # Misc
     p.add_argument("--scaler",               default="zscore",
                    choices=["zscore", "minmax"])
@@ -904,17 +1398,35 @@ def main() -> None:
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    n_nodes = split.x_train.shape[2]
+    n_nodes    = split.x_train.shape[2]
     n_features = split.x_train.shape[3]
-    model   = STQGCN(
-        n_nodes          = n_nodes,
-        n_features       = n_features,
-        hidden_dim       = args.hidden_dim,
-        n_qubits         = args.n_qubits,
-        n_q_layers       = args.n_q_layers,
-        dropout          = args.dropout,
-        target_node_idx  = target_col_idx,
-    ).to(device)
+
+    if args.hierarchical:
+        print(
+            f"\nBuilding HierarchicalSTQGN — pool_ratio={args.pool_ratio} "
+            f"| Bloch log every {args.bloch_log_interval} epochs (Layer {args.bloch_log_layer})"
+        )
+        model = HierarchicalSTQGN(
+            n_nodes         = n_nodes,
+            n_features      = n_features,
+            hidden_dim      = args.hidden_dim,
+            n_q_layers      = args.n_q_layers,
+            dropout         = args.dropout,
+            pool_ratio      = args.pool_ratio,
+            target_node_idx = target_col_idx,
+        ).to(device)
+        bloch_logger = BlochSphereLogger(log_layer=args.bloch_log_layer)
+    else:
+        model = STQGCN(
+            n_nodes          = n_nodes,
+            n_features       = n_features,
+            hidden_dim       = args.hidden_dim,
+            n_qubits         = args.n_qubits,
+            n_q_layers       = args.n_q_layers,
+            dropout          = args.dropout,
+            target_node_idx  = target_col_idx,
+        ).to(device)
+        bloch_logger = None
 
     # OPT-5: torch.compile fuses classical ops (PyTorch ≥ 2.0, Linux only)
     # Triton (required by the inductor backend) is not available on Windows.
@@ -977,6 +1489,14 @@ def main() -> None:
         train_mae_sum = 0.0
         train_loss_sum = 0.0
 
+        # Whether to capture Bloch data on this epoch
+        capture_bloch = (
+            args.hierarchical
+            and bloch_logger is not None
+            and (epoch == 1 or epoch % args.bloch_log_interval == 0)
+        )
+        epoch_bloch_angles: Dict[int, List[torch.Tensor]] = {}
+
         pbar = tqdm(
             train_loader,
             desc=f"Epoch {epoch:03d}/{args.epochs}",
@@ -988,7 +1508,19 @@ def main() -> None:
 
             # OPT-6: AMP forward pass
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                pred = model(xb, norm_adj).float()
+                if capture_bloch:
+                    # Run with Bloch data capture on first batch of epoch only
+                    # (capturing every batch would be very slow)
+                    pred, bloch_angles = model(xb, norm_adj, return_bloch_data=True)
+                    pred = pred.float()
+                    # Accumulate one batch's angles
+                    for lid, ang in bloch_angles.items():
+                        if lid not in epoch_bloch_angles:
+                            epoch_bloch_angles[lid] = []
+                        epoch_bloch_angles[lid].append(ang.cpu())
+                    capture_bloch = False  # only first batch per epoch
+                else:
+                    pred = model(xb, norm_adj).float()
                 loss = criterion(pred, yb)
 
             if not torch.isfinite(loss):
@@ -1008,6 +1540,14 @@ def main() -> None:
             pbar.set_postfix(
                 train_mse=f"{train_mse_sum / max(train_count, 1):.5f}"
             )
+
+        # Record Bloch angles for this epoch (mean across captured batches)
+        if args.hierarchical and bloch_logger is not None and epoch_bloch_angles:
+            mean_angles = {
+                lid: torch.cat(tensors, dim=0).mean(dim=0, keepdim=True)
+                for lid, tensors in epoch_bloch_angles.items()
+            }
+            bloch_logger.record(epoch, mean_angles)
 
         train_loss       = train_loss_sum / max(train_count, 1)
         train_mse        = train_mse_sum / max(train_count, 1)
@@ -1165,6 +1705,16 @@ def main() -> None:
     print(f"  Saved test preds → {test_pred_csv_path}")
     print(f"  Saved metrics    → {metrics_path}")
     print(f"  Saved plots      → {plots_dir}")
+
+    # ── Bloch sphere images + video (hierarchical mode only) ──────────────────
+    if args.hierarchical and bloch_logger is not None and bloch_logger.log:
+        bloch_log_path = runs_dir / "bloch_coords.json"
+        bloch_logger.save(bloch_log_path)
+        generate_bloch_sphere_images(bloch_logger, plots_dir)
+        print(f"  Saved Bloch log  → {bloch_log_path}")
+        print(f"  Saved Bloch PNGs → {plots_dir / 'bloch_spheres'}")
+    elif args.hierarchical:
+        print("  Warning: no Bloch sphere data was captured (all epochs may have been skipped).")
 
 
 if __name__ == "__main__":

@@ -398,15 +398,28 @@ def _load_engine() -> None:
     # quantum refinement boost (node 0 by default here). All other nodes still
     # get accurate predictions via the shared classical GCN + readout.
     print(f"[api_server] Building single inference model (replaces 50-model loop)…")
-    m = STQGCN(
-        n_nodes         = _engine.n_nodes,
-        n_features      = _engine.n_features,
-        hidden_dim      = _engine.hidden_dim,
-        n_qubits        = _engine.n_qubits,
-        n_q_layers      = _engine.n_q_layers,
-        dropout         = _engine.dropout,
-        target_node_idx = 0,
-    )
+    is_hierarchical = cfg.get("hierarchical", False)
+    if is_hierarchical:
+        from train_stqgcn import HierarchicalSTQGN
+        m = HierarchicalSTQGN(
+            n_nodes         = _engine.n_nodes,
+            n_features      = _engine.n_features,
+            hidden_dim      = _engine.hidden_dim,
+            n_q_layers      = _engine.n_q_layers,
+            dropout         = _engine.dropout,
+            pool_ratio      = cfg.get("pool_ratio", 3),
+            target_node_idx = 0,
+        )
+    else:
+        m = STQGCN(
+            n_nodes         = _engine.n_nodes,
+            n_features      = _engine.n_features,
+            hidden_dim      = _engine.hidden_dim,
+            n_qubits        = _engine.n_qubits,
+            n_q_layers      = _engine.n_q_layers,
+            dropout         = _engine.dropout,
+            target_node_idx = 0,
+        )
     result = m.load_state_dict(ckpt["model_state_dict"], strict=False)
     if result.unexpected_keys:
         print(f"[api_server] Unexpected keys: {result.unexpected_keys}")
@@ -502,11 +515,33 @@ def _run_inference(overrides: Dict[str, Dict[str, float]], global_params: Dict[s
             x_tensor = torch.from_numpy(current_window).unsqueeze(0).float().to(_engine.device)
 
             with torch.no_grad():
-                # The model now returns [1, N] tensor containing predictions for ALL nodes
-                preds_norm = model(x_tensor, _engine.norm_adj)
-                preds_norm = preds_norm.squeeze(0)  # [N]
+                # HierarchicalSTQGN.forward() returns [B, 1] — a single global
+                # graph-level prediction.  Expand it to per-node predictions by
+                # blending the global forecast with each node's baseline flow so
+                # every node gets a distinct, physically-meaningful value.
+                raw_out = model(x_tensor, _engine.norm_adj)   # [B, 1] or [B, N]
+                raw_out = raw_out.squeeze(0).cpu().numpy().astype(np.float32)  # [1] or [N]
 
-            step_results = preds_norm.cpu().numpy().astype(np.float32)
+            n_out = raw_out.size  # number of model outputs
+
+            if n_out >= _engine.n_nodes:
+                # Model already returns per-node predictions — use directly
+                step_results = raw_out[:_engine.n_nodes]
+            else:
+                # Model returns a scalar / reduced output (HierarchicalSTQGN [1]).
+                # Distribute across N nodes:
+                #   node_pred[i] = global_pred * (baseline_flow[i] / mean_baseline)
+                # This preserves the model's overall magnitude while giving each
+                # node a proportion of that forecast relative to its own baseline.
+                global_pred_norm = float(raw_out.flat[0])  # normalised scalar
+
+                # Per-node normalised baselines from the last window timestep
+                node_baselines = current_window[-1, :, _engine.flow_feat_idx].copy()  # [N]
+                mean_baseline  = float(np.mean(np.abs(node_baselines))) + 1e-9
+
+                # Blend: global forecast scaled by each node's relative baseline
+                step_results = (global_pred_norm * (node_baselines / mean_baseline)).astype(np.float32)
+
             denorm_preds = step_results * _engine.y_std + _engine.y_mean
             all_step_preds.append(denorm_preds.tolist())
 
@@ -539,7 +574,11 @@ def _run_inference(overrides: Dict[str, Dict[str, float]], global_params: Dict[s
             "zone": meta["zone"],
             "capacity_veh_per_hr": meta["capacity"],
             "flow_t": float(flow_at_t[i]),
-            "predictions": [float(all_step_preds[s][i]) for s in range(n_steps)]
+            # Guard: clamp step-prediction index in case step list is shorter than n_nodes
+            "predictions": [
+                float(all_step_preds[s][min(i, len(all_step_preds[s]) - 1)])
+                for s in range(n_steps)
+            ],
         })
         
     return nodes_out
@@ -681,13 +720,56 @@ def run_plots(run_name: str) -> Dict[str, Any]:
     plots_dir = run_dir / "plots"
     if not plots_dir.exists() or not plots_dir.is_dir():
         return {"run": run_name, "plots": []}
-    
+
     plots = []
-    for p in plots_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in [".png", ".jpg", ".jpeg", ".svg"]:
+
+    # ── Training plots (PNG/JPG/SVG in plots/ root) ───────────────────────────
+    image_exts = {".png", ".jpg", ".jpeg", ".svg"}
+    video_exts = {".mp4", ".webm", ".ogg"}
+
+    for p in sorted(plots_dir.iterdir()):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext in image_exts:
             url_path = f"/api/static/runs/{run_name}/plots/{p.name}"
-            plots.append({"name": p.name, "url": url_path})
-            
+            plots.append({
+                "name":  p.name,
+                "url":   url_path,
+                "type":  "image",
+                "group": "training",
+            })
+        elif ext in video_exts:
+            url_path = f"/api/static/runs/{run_name}/plots/{p.name}"
+            plots.append({
+                "name":  p.name,
+                "url":   url_path,
+                "type":  "video",
+                "group": "bloch_video",
+            })
+
+    # ── Bloch sphere per-qubit PNGs (bloch_spheres/ subdirectory) ────────────
+    bloch_dir = plots_dir / "bloch_spheres"
+    if bloch_dir.exists() and bloch_dir.is_dir():
+        for p in sorted(bloch_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in image_exts:
+                url_path = f"/api/static/runs/{run_name}/plots/bloch_spheres/{p.name}"
+                # Extract qubit index from filename "bloch_qubit_N.png"
+                qubit_idx = None
+                stem = p.stem  # e.g. "bloch_qubit_3"
+                if stem.startswith("bloch_qubit_"):
+                    try:
+                        qubit_idx = int(stem.split("_")[-1])
+                    except ValueError:
+                        pass
+                plots.append({
+                    "name":       p.name,
+                    "url":        url_path,
+                    "type":       "image",
+                    "group":      "bloch_sphere",
+                    "qubit_idx":  qubit_idx,
+                })
+
     return {"run": run_name, "plots": plots}
 
 

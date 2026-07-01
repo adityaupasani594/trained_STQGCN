@@ -1,10 +1,10 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Oxanium:wght@400;600;700&display=swap');
-@import 'tailwindcss';
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Merriweather+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
 :root {
-  font-family: 'Space Grotesk', sans-serif;
-  color: #e7f1ff;
-  background: #070f1d;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 17px;
+  color: #2c2c2e;
+  background: #f5f0e8;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -26,20 +26,59 @@ body {
   min-height: 100vh;
 }
 
+/* ── Research Display Font ──────────────────────────────────────────────────── */
 .font-display {
-  font-family: 'Oxanium', sans-serif;
+  font-family: 'Merriweather Sans', sans-serif;
 }
 
-.bg-night-grid {
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── Research Background (warm parchment/cream) ─────────────────────────────── */
+.bg-research-paper {
   background:
-    radial-gradient(circle at 9% 14%, rgba(20, 197, 255, 0.15) 0%, rgba(20, 197, 255, 0) 40%),
-    radial-gradient(circle at 90% 82%, rgba(255, 97, 71, 0.16) 0%, rgba(255, 97, 71, 0) 42%),
-    linear-gradient(160deg, #07111d 0%, #111f31 50%, #09121f 100%);
+    radial-gradient(ellipse at 12% 8%, rgba(180, 140, 80, 0.08) 0%, transparent 45%),
+    radial-gradient(ellipse at 88% 90%, rgba(100, 160, 220, 0.07) 0%, transparent 40%),
+    linear-gradient(165deg, #f7f3ec 0%, #f0ead8 40%, #ede5d5 100%);
 }
 
+/* ── Glass Panel (warm ivory, not dark) ─────────────────────────────────────── */
 .glass-panel {
-  background: linear-gradient(145deg, rgba(14, 27, 43, 0.86), rgba(9, 18, 31, 0.76));
-  backdrop-filter: blur(10px);
+  background: linear-gradient(145deg, rgba(255, 252, 246, 0.92), rgba(250, 246, 238, 0.88));
+  backdrop-filter: blur(14px);
+  border: 1px solid rgba(180, 155, 110, 0.22);
+  box-shadow:
+    0 2px 8px rgba(100, 80, 40, 0.06),
+    0 12px 40px rgba(100, 80, 40, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
+/* ── Section / Card dividers ────────────────────────────────────────────────── */
+.research-divider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(160, 120, 60, 0.3), transparent);
+}
+
+/* ── Scrollbar styling (warm tones) ─────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(200, 180, 140, 0.15);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(160, 120, 70, 0.35);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(140, 100, 50, 0.55);
+}
+
+/* ── Range Slider ────────────────────────────────────────────────────────────── */
+input[type='range'] {
+  accent-color: #2d7dd2;
 }
 
 input[type='range']::-webkit-slider-thumb {
@@ -47,16 +86,62 @@ input[type='range']::-webkit-slider-thumb {
   height: 16px;
   width: 16px;
   border-radius: 999px;
-  background: #5eead4;
-  border: 2px solid #072530;
-  box-shadow: 0 0 0 2px rgba(94, 234, 212, 0.3);
+  background: #2d7dd2;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 2px rgba(45, 125, 210, 0.28), 0 2px 6px rgba(45, 125, 210, 0.3);
 }
 
 input[type='range']::-moz-range-thumb {
   height: 16px;
   width: 16px;
   border-radius: 999px;
-  background: #5eead4;
-  border: 2px solid #072530;
-  box-shadow: 0 0 0 2px rgba(94, 234, 212, 0.3);
+  background: #2d7dd2;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 2px rgba(45, 125, 210, 0.28);
+}
+
+/* ── Badge / Tag ─────────────────────────────────────────────────────────────── */
+.research-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 9px;
+  border-radius: 9999px;
+  border: 1px solid;
+}
+
+/* ── Utility text colours for research palette ──────────────────────────────── */
+.text-research-primary   { color: #1a2e4a; }
+.text-research-secondary { color: #4a5568; }
+.text-research-accent    { color: #2d7dd2; }
+.text-research-warm      { color: #7c5c2e; }
+.text-research-muted     { color: #8a7d6b; }
+
+/* ── Keyframes ─────────────────────────────────────────────────────────────── */
+@keyframes pulse {
+  0%, 100% { opacity: 1;   transform: scale(1);    }
+  50%       { opacity: 0.6; transform: scale(1.25); }
+}
+
+@keyframes quantumSpin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes networkGlow {
+  0%, 100% { box-shadow: 0 0 8px  currentColor; }
+  50%       { box-shadow: 0 0 20px currentColor; }
+}
+
+/* ── Quantum node / ring helpers ────────────────────────────────────────────── */
+.quantum-glow {
+  animation: networkGlow 2.4s ease-in-out infinite;
+}
+
+.enhance-btn:hover {
+  opacity: 0.85;
+  transform: scale(1.04);
+  transition: opacity 0.18s, transform 0.18s;
 }
